@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyCharm
+.idea/
+
+# Output files
+outputs/
+*.png
+
+#*.png
+#!test_spot.png            忽略所有 png，但不忽略 test_spot.png
+
+
+# Conda / virtual env
+.env
