@@ -21,10 +21,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.patches import Ellipse, FancyArrowPatch, Circle
+from matplotlib.patches import Ellipse
 from matplotlib.colors import Normalize
-from matplotlib import cm
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.optimize import curve_fit
 
 # ── 中文字体配置 ─────────────────────────────────────────────
@@ -37,7 +35,8 @@ from config import (
     PIXEL_SIZE_UM, DEMAGNIFICATION, FOCAL_PLANE_SCALE_UM_PX,
     SPOT_SIGMA_PX, SPOT_PEAK_COUNTS, BACKGROUND_COUNTS,
     TARGET_ACCURACY_UM, RANDOM_SEED,
-    REFERENCE_GRID_SPACING_MM, REFERENCE_GRID_ORIGIN_MM, OUTPUT_DIR
+    REFERENCE_GRID_SPACING_MM, REFERENCE_GRID_ORIGIN_MM, OUTPUT_DIR,
+    ELLIPTICAL_SPOT_PROB, ELLIPTICITY_RANGE
 )
 from spot_generator import generate_gaussian_spot
 from gaussian_detector import fit_gaussian
@@ -48,8 +47,8 @@ VIZ_DIR = os.path.join(OUTPUT_DIR, "figures", "visualization")
 os.makedirs(VIZ_DIR, exist_ok=True)
 
 # ── 与 main_pipeline.py 保持一致的常量 ────────────────────────
-REF_GRID_SIDE = 5
-DISTORTION_DEGREE = 2
+REF_GRID_SIDE = 7
+DISTORTION_DEGREE = 4
 
 
 # ============================================================
@@ -69,10 +68,12 @@ def build_reference_grid(n_side=REF_GRID_SIDE,
     return np.array(ref_focal, dtype=float)
 
 
-def focal_to_pixel(focal_um, scale=None, rotation_deg=0.5,
-                   offset_px=(3000.0, 2500.0)):
+def focal_to_pixel(focal_um, scale=None, rotation_deg=0.5, offset_px=None):
     if scale is None:
         scale = 1.0 / FOCAL_PLANE_SCALE_UM_PX
+    if offset_px is None:
+        from config import IMAGE_WIDTH, IMAGE_HEIGHT
+        offset_px = (IMAGE_WIDTH / 2, IMAGE_HEIGHT / 2)
     angle = np.deg2rad(rotation_deg)
     R = np.array([[np.cos(angle), -np.sin(angle)],
                   [np.sin(angle),  np.cos(angle)]])
@@ -89,9 +90,7 @@ def gaussian_2d(xy, amplitude, x0, y0, sigma_x, sigma_y, theta, offset):
 
 
 def add_colorbar(fig, ax, im, label=''):
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes("right", size="4%", pad=0.05)
-    cb = fig.colorbar(im, cax=cax)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label(label, fontsize=9)
     return cb
 
@@ -105,10 +104,11 @@ def viz_spot(rng, save=True):
     print("\n[1/4] 生成光斑可视化...")
 
     patch_size = 60
-    cx = patch_size / 2 + 2.3   # 故意加亚像素偏移，更真实
+    cx = patch_size / 2 + 2.3
     cy = patch_size / 2 - 1.7
 
-    spot = generate_gaussian_spot(cx, cy, image_size=patch_size, rng=rng)
+    spot = generate_gaussian_spot(cx, cy, image_size=patch_size, rng=rng,
+                                  ellipticity_prob=ELLIPTICAL_SPOT_PROB)
 
     fig = plt.figure(figsize=(16, 5))
     fig.suptitle('光纤端面光斑仿真图像', fontsize=14, fontweight='bold', y=1.01)
@@ -118,21 +118,20 @@ def viz_spot(rng, save=True):
     ax1 = fig.add_subplot(gs[0])
     im1 = ax1.imshow(spot, cmap='hot', origin='upper', aspect='equal')
     add_colorbar(fig, ax1, im1, 'counts')
-    # 标注真实质心位置
     ax1.plot(cx, cy, '+', color='cyan', markersize=14, markeredgewidth=2,
              label=f'真实质心 ({cx:.1f}, {cy:.1f})')
-    # 标注1sigma和2sigma椭圆
+
     for nsig, ls in [(1, '-'), (2, '--')]:
-        ell = Ellipse((cx, cy), width=2*nsig*SPOT_SIGMA_PX, height=2*nsig*SPOT_SIGMA_PX,
+        ell = Ellipse((cx, cy), width=2 * nsig * SPOT_SIGMA_PX, height=2 * nsig * SPOT_SIGMA_PX,
                       edgecolor='lime', facecolor='none', linestyle=ls, linewidth=1.2,
-                      label=f'{nsig}σ = {nsig*SPOT_SIGMA_PX:.1f} px')
+                      label=f'{nsig}σ ≈ {nsig * SPOT_SIGMA_PX:.1f} px')
         ax1.add_patch(ell)
+
     ax1.legend(fontsize=7.5, loc='upper right')
     ax1.set_title('2D光斑灰度图（热度图）', fontsize=10)
     ax1.set_xlabel('像素 X')
     ax1.set_ylabel('像素 Y')
 
-    # 像素尺寸标注
     ax1.annotate('', xy=(5, patch_size-5), xytext=(15, patch_size-5),
                  arrowprops=dict(arrowstyle='<->', color='white', lw=1.5))
     ax1.text(10, patch_size-8, '10 px', ha='center', va='top',
@@ -149,7 +148,6 @@ def viz_spot(rng, save=True):
     ax2.plot(px_range, y_profile, 'r-s', markersize=3, linewidth=1.5,
              label='Y方向剖面')
 
-    # 拟合高斯曲线叠加
     x_fine = np.linspace(0, patch_size-1, 300)
     peak = SPOT_PEAK_COUNTS
     bg = BACKGROUND_COUNTS
@@ -164,8 +162,7 @@ def viz_spot(rng, save=True):
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    # SNR标注
-    noise_std = np.std(spot[:5, :5])  # 角落估算背景噪声
+    noise_std = np.std(spot[:5, :5])
     snr = (peak - bg) / noise_std if noise_std > 0 else 0
     ax2.text(0.02, 0.97, f'SNR ≈ {snr:.0f}', transform=ax2.transAxes,
              va='top', fontsize=9, color='green',
@@ -174,7 +171,6 @@ def viz_spot(rng, save=True):
     # ── 子图3：3D强度曲面 ──
     ax3 = fig.add_subplot(gs[2], projection='3d')
     X3, Y3 = np.meshgrid(np.arange(patch_size), np.arange(patch_size))
-    # 降采样加速渲染
     step = 2
     surf = ax3.plot_surface(X3[::step, ::step], Y3[::step, ::step],
                             spot[::step, ::step],
@@ -186,17 +182,18 @@ def viz_spot(rng, save=True):
     ax3.view_init(elev=30, azim=-60)
     fig.colorbar(surf, ax=ax3, shrink=0.4, aspect=8, label='counts')
 
-    # 物理尺寸参数注释框
     info = (f'传感器像素: {PIXEL_SIZE_UM} μm\n'
             f'缩放比: {DEMAGNIFICATION}×\n'
             f'焦面尺度: {FOCAL_PLANE_SCALE_UM_PX:.1f} μm/px\n'
             f'光斑σ: {SPOT_SIGMA_PX} px = {SPOT_SIGMA_PX*PIXEL_SIZE_UM:.2f} μm\n'
             f'峰值: {SPOT_PEAK_COUNTS} counts\n'
             f'背景: {BACKGROUND_COUNTS} counts')
-    fig.text(0.01, 0.01, info, fontsize=7.5, va='bottom',
+    fig.text(0.015, 0.02, info, fontsize=7.5, va='bottom',
              bbox=dict(boxstyle='round', facecolor='#f0f0f0', alpha=0.9))
 
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.06, right=0.97, bottom=0.08, top=0.92,
+                        wspace=0.35, hspace=0.30)
+
     path = os.path.join(VIZ_DIR, "1_spot_image.png")
     if save:
         plt.savefig(path, dpi=150, bbox_inches='tight')
@@ -213,12 +210,12 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
     """质心定位过程可视化：原始图像 → 高斯拟合 → 残差 → 收敛曲线"""
     print("\n[2/4] 生成质心定位可视化...")
 
-    result = fit_gaussian(spot, sigma_init=SPOT_SIGMA_PX)
+    result = fit_gaussian(spot, sigma_init=SPOT_SIGMA_PX,
+                          use_elliptical=True)
     fit_cx = result['x0']
     fit_cy = result['y0']
     patch_size = spot.shape[0]
 
-    # 重建拟合高斯图像
     x_arr = np.arange(patch_size, dtype=float)
     y_arr = np.arange(patch_size, dtype=float)
     X, Y = np.meshgrid(x_arr, y_arr)
@@ -242,7 +239,7 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
     im1 = ax1.imshow(spot, cmap=cmap_main, origin='upper', vmin=vmin, vmax=vmax)
     add_colorbar(fig, ax1, im1, 'counts')
     ax1.plot(true_cx, true_cy, '+', color='cyan', markersize=16, markeredgewidth=2.5,
-             label=f'真实质心')
+             label='真实质心')
     ax1.set_title('原始光斑图像', fontsize=10)
     ax1.set_xlabel('像素 X')
     ax1.set_ylabel('像素 Y')
@@ -253,10 +250,9 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
     im2 = ax2.imshow(fit_img, cmap=cmap_main, origin='upper', vmin=vmin, vmax=vmax)
     add_colorbar(fig, ax2, im2, 'counts')
     ax2.plot(fit_cx, fit_cy, 'x', color='yellow', markersize=16, markeredgewidth=2.5,
-             label=f'拟合质心')
+             label='拟合质心')
     ax2.plot(true_cx, true_cy, '+', color='cyan', markersize=12, markeredgewidth=1.5,
              alpha=0.7, label='真实质心')
-    # 用箭头连接两个质心
     ax2.annotate('', xy=(fit_cx, fit_cy), xytext=(true_cx, true_cy),
                  arrowprops=dict(arrowstyle='->', color='white', lw=1.5))
     ax2.set_title('高斯拟合重建图像', fontsize=10)
@@ -269,8 +265,9 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
              f'真实质心: ({true_cx:.4f}, {true_cy:.4f})\n'
              f'误差: {err_px:.5f} px = {err_um:.3f} μm\n'
              f'SNR: {result["snr"]:.1f}')
-    ax2.text(0.02, 0.02, info2, transform=ax2.transAxes, va='bottom', fontsize=7.5,
-             bbox=dict(boxstyle='round', facecolor='#1a1a2e', alpha=0.85), color='white')
+    ax2.text(0.03, 0.03, info2, transform=ax2.transAxes, va='bottom', fontsize=7,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a2e', alpha=0.85),
+             color='white')
 
     # ── 子图3：残差图 ──
     ax3 = fig.add_subplot(gs[2])
@@ -292,8 +289,10 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
     n_repeat = 300
     errs_px = []
     for _ in range(n_repeat):
-        s = generate_gaussian_spot(true_cx, true_cy, image_size=patch_size, rng=rng)
-        r = fit_gaussian(s, sigma_init=SPOT_SIGMA_PX)
+        s = generate_gaussian_spot(true_cx, true_cy, image_size=patch_size, rng=rng,
+                                   ellipticity_prob=ELLIPTICAL_SPOT_PROB)
+        r = fit_gaussian(s, sigma_init=SPOT_SIGMA_PX,
+                         use_elliptical=True)
         if r['success']:
             errs_px.append(np.sqrt((r['x0']-true_cx)**2 + (r['y0']-true_cy)**2))
 
@@ -307,11 +306,11 @@ def viz_centroid(spot, true_cx, true_cy, rng, save=True):
                 label=f'目标={TARGET_ACCURACY_UM}μm')
     ax4.set_xlabel('质心误差 (μm)')
     ax4.set_ylabel('概率密度')
-    ax4.set_title(f'质心定位误差分布\n(N={n_repeat}次重复实验)', fontsize=10)
-    ax4.legend(fontsize=8)
+    ax4.set_title(f'质心定位误差分布\n(N={n_repeat})', fontsize=10)
+    ax4.legend(fontsize=8, loc='upper right', framealpha=0.9)
     ax4.grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.05, right=0.98, bottom=0.12, top=0.86, wspace=0.35)
     path = os.path.join(VIZ_DIR, "2_centroid_fitting.png")
     if save:
         plt.savefig(path, dpi=150, bbox_inches='tight')
@@ -346,7 +345,6 @@ def viz_calibration(rng, save=True):
                 s=30, c='red', marker='+', zorder=6, linewidths=1.5,
                 label='理想格网位置')
 
-    # 绘制格网连线
     n = REF_GRID_SIDE
     for i in range(n):
         row_idx = [i*n + j for j in range(n)]
@@ -357,10 +355,11 @@ def viz_calibration(rng, save=True):
         ax1.plot(ref_px_detected[col_idx, 0], ref_px_detected[col_idx, 1],
                  'b-', alpha=0.3, linewidth=0.8)
 
-    # 标注序号
+    # 标注序号（最终美化微调：只标一半编号，减少拥挤）
     for k, (px, py) in enumerate(ref_px_detected):
-        ax1.annotate(str(k+1), (px, py), textcoords='offset points',
-                     xytext=(5, 5), fontsize=6.5, color='darkblue')
+        if k % 2 == 0:
+            ax1.annotate(str(k+1), (px, py), textcoords='offset points',
+                         xytext=(4, 4), fontsize=6, color='darkblue')
 
     ax1.set_xlabel('像素 X')
     ax1.set_ylabel('像素 Y')
@@ -368,43 +367,37 @@ def viz_calibration(rng, save=True):
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
     ax1.set_aspect('equal')
-
-    # 传感器范围示意
     ax1.set_xlim([ref_px_detected[:, 0].min() - 100, ref_px_detected[:, 0].max() + 100])
     ax1.set_ylim([ref_px_detected[:, 1].min() - 100, ref_px_detected[:, 1].max() + 100])
 
     # ── 子图2：焦面坐标系中的分布与标定残差矢量 ──
     ax2 = fig.add_subplot(gs[1])
 
-    # 仿射残差（标定前）
     from coordinate_transform import fit_affine, apply_affine
     A, t = fit_affine(ref_px_detected, ref_focal_um)
     affine_pred = apply_affine(ref_px_detected, A, t)
     affine_err = ref_focal_um - affine_pred
 
-    # 最终残差（标定后）
     final_pred = calibrator.transform(ref_px_detected)
     final_err = ref_focal_um - final_pred
 
-    # 画焦面格网
     ref_x_mm = ref_focal_um[:, 0] / 1000
     ref_y_mm = ref_focal_um[:, 1] / 1000
     ax2.scatter(ref_x_mm, ref_y_mm, s=60, c='gray', zorder=3, alpha=0.5,
                 label='焦面真值位置')
 
-    # 仿射残差矢量（放大显示）
     scale_vis = 800
-    q1 = ax2.quiver(ref_x_mm, ref_y_mm,
-                    affine_err[:, 0] * scale_vis / 1000,
-                    affine_err[:, 1] * scale_vis / 1000,
-                    color='orange', alpha=0.7, scale=1, scale_units='xy',
-                    width=0.005, label=f'仿射残差(×{scale_vis})')
+    ax2.quiver(ref_x_mm, ref_y_mm,
+               affine_err[:, 0] * scale_vis / 1000,
+               affine_err[:, 1] * scale_vis / 1000,
+               color='orange', alpha=0.7, scale=1, scale_units='xy',
+               width=0.005, label=f'仿射残差(×{scale_vis})')
 
-    q2 = ax2.quiver(ref_x_mm, ref_y_mm,
-                    final_err[:, 0] * scale_vis / 1000,
-                    final_err[:, 1] * scale_vis / 1000,
-                    color='blue', alpha=0.9, scale=1, scale_units='xy',
-                    width=0.003, label=f'最终残差(×{scale_vis})')
+    ax2.quiver(ref_x_mm, ref_y_mm,
+               final_err[:, 0] * scale_vis / 1000,
+               final_err[:, 1] * scale_vis / 1000,
+               color='blue', alpha=0.9, scale=1, scale_units='xy',
+               width=0.003, label=f'最终残差(×{scale_vis})')
 
     ax2.set_xlabel('焦面 X (mm)')
     ax2.set_ylabel('焦面 Y (mm)')
@@ -419,8 +412,8 @@ def viz_calibration(rng, save=True):
             f'最终残差 RMS: {rms_final:.3f} μm\n'
             f'畸变阶数: {DISTORTION_DEGREE}阶多项式\n'
             f'参数比: {REF_GRID_SIDE**2 * 2 / 6:.0f}:1')
-    ax2.text(0.02, 0.02, info, transform=ax2.transAxes, va='bottom', fontsize=8,
-             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+    ax2.text(0.03, 0.03, info, transform=ax2.transAxes, va='bottom', fontsize=7.5,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
 
     # ── 子图3：标定前后误差对比柱状图 ──
     ax3 = fig.add_subplot(gs[2])
@@ -430,12 +423,12 @@ def viz_calibration(rng, save=True):
 
     pts = np.arange(1, REF_GRID_SIDE**2 + 1)
     width = 0.35
-    bars1 = ax3.bar(pts - width/2, err_affine_per_pt, width,
-                    label=f'仿射变换 (RMS={rms_affine:.3f}μm)',
-                    color='orange', alpha=0.8, edgecolor='white')
-    bars2 = ax3.bar(pts + width/2, err_final_per_pt, width,
-                    label=f'含畸变校正 (RMS={rms_final:.3f}μm)',
-                    color='steelblue', alpha=0.8, edgecolor='white')
+    ax3.bar(pts - width/2, err_affine_per_pt, width,
+            label=f'仿射变换 (RMS={rms_affine:.3f}μm)',
+            color='orange', alpha=0.8, edgecolor='white')
+    ax3.bar(pts + width/2, err_final_per_pt, width,
+            label=f'含畸变校正 (RMS={rms_final:.3f}μm)',
+            color='steelblue', alpha=0.8, edgecolor='white')
 
     ax3.axhline(TARGET_ACCURACY_UM, color='red', linestyle='--', linewidth=1.5,
                 label=f'目标精度 {TARGET_ACCURACY_UM}μm')
@@ -444,9 +437,9 @@ def viz_calibration(rng, save=True):
     ax3.set_title('各基准点标定前后误差对比', fontsize=10)
     ax3.legend(fontsize=8)
     ax3.grid(True, alpha=0.3, axis='y')
-    ax3.set_xticks(pts[::2])
+    ax3.set_xticks(pts[::4])
 
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.05, right=0.98, bottom=0.12, top=0.86, wspace=0.40)
     path = os.path.join(VIZ_DIR, "3_calibration_points.png")
     if save:
         plt.savefig(path, dpi=150, bbox_inches='tight')
@@ -464,7 +457,6 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     """坐标变换可视化：映射关系 + 变换精度 + 误差分布"""
     print("\n[4/4] 生成坐标变换可视化...")
 
-    # 生成待测光纤数据
     focal_min = ref_focal_um.min(axis=0)
     focal_max = ref_focal_um.max(axis=0)
     margin = 0.10
@@ -476,15 +468,16 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     target_focal_true = rng.uniform(target_low, target_high, (n_targets, 2))
     target_px_true = focal_to_pixel(target_focal_true)
 
-    # 与主流程一致：通过生成光斑→高斯拟合获得检测坐标
     patch_size = 50
     target_px_detected = []
     for px, py in target_px_true:
         true_cx = patch_size / 2 + (px - round(px))
         true_cy = patch_size / 2 + (py - round(py))
         patch = generate_gaussian_spot(true_cx, true_cy,
-                                       image_size=patch_size, rng=rng)
-        result = fit_gaussian(patch, sigma_init=SPOT_SIGMA_PX)
+                                       image_size=patch_size, rng=rng,
+                                       ellipticity_prob=ELLIPTICAL_SPOT_PROB)
+        result = fit_gaussian(patch, sigma_init=SPOT_SIGMA_PX,
+                              use_elliptical=True)
         if result['success']:
             offset_x = round(px) - patch_size // 2
             offset_y = round(py) - patch_size // 2
@@ -512,7 +505,6 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     ax1.scatter(target_px_detected[:, 0], target_px_detected[:, 1], s=30,
                 c='steelblue', zorder=4, alpha=0.7, label='待测光纤（像素坐标）')
 
-    # 绘制变换方向箭头示意（选几个点）
     sample_idx = [0, 12, 24, n_targets//2]
     for idx in sample_idx[:3]:
         px_x, px_y = target_px_detected[idx]
@@ -525,10 +517,10 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     ax1.set_title('像素坐标系\n（传感器平面，原点在左上角）', fontsize=10)
     ax1.legend(fontsize=8, loc='upper right')
     ax1.grid(True, alpha=0.3)
-    ax1.text(0.02, 0.02,
-             f'传感器像素: {PIXEL_SIZE_UM}μm\n坐标原点: 图像左上角\n↓ 坐标变换（标定矩阵）',
-             transform=ax1.transAxes, va='bottom', fontsize=8,
-             bbox=dict(boxstyle='round', facecolor='#fff9e6', alpha=0.9))
+    ax1.text(0.03, 0.03,
+             f'传感器像素: {PIXEL_SIZE_UM}μm\n坐标原点: 图像左上角\n↓ 坐标变换',
+             transform=ax1.transAxes, va='bottom', fontsize=7.5,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='#fff9e6', alpha=0.9))
 
     # ── 子图2：焦面坐标系 ──
     ax2 = fig.add_subplot(gs[1])
@@ -549,13 +541,13 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     ax2.set_xlabel('焦面 X (mm)')
     ax2.set_ylabel('焦面 Y (mm)')
     ax2.set_title('焦面坐标系\n（物理空间，原点由设计定义）', fontsize=10)
-    ax2.legend(fontsize=8, loc='upper right')
+    ax2.legend(fontsize=8, loc='upper left')  # 最终美化微调：图例移到左上角
     ax2.grid(True, alpha=0.3)
     ax2.set_aspect('equal')
-    ax2.text(0.02, 0.02,
-             f'焦面尺度: {FOCAL_PLANE_SCALE_UM_PX:.1f}μm/px\n坐标原点: ({REFERENCE_GRID_ORIGIN_MM[0]}, {REFERENCE_GRID_ORIGIN_MM[1]})mm',
-             transform=ax2.transAxes, va='bottom', fontsize=8,
-             bbox=dict(boxstyle='round', facecolor='#e6f2ff', alpha=0.9))
+    ax2.text(0.03, 0.03,
+             f'焦面尺度: {FOCAL_PLANE_SCALE_UM_PX:.1f} μm/px\n原点: ({REFERENCE_GRID_ORIGIN_MM[0]}, {REFERENCE_GRID_ORIGIN_MM[1]}) mm',
+             transform=ax2.transAxes, va='bottom', fontsize=7.5,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='#e6f2ff', alpha=0.9))
 
     # ── 子图3：误差矢量图（焦面坐标系） ──
     ax3 = fig.add_subplot(gs[2])
@@ -567,7 +559,6 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
                      norm=Normalize(vmin=0, vmax=TARGET_ACCURACY_UM))
     plt.colorbar(sc, ax=ax3, label='误差 (μm)', shrink=0.9)
 
-    # 误差矢量（放大500倍）
     scale_v = 500
     ax3.quiver(tgt_true_x_mm, tgt_true_y_mm,
                err[:, 0] / 1000 * scale_v,
@@ -585,12 +576,11 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
              f'X RMS: {np.std(err[:,0]):.3f} μm\n'
              f'Y RMS: {np.std(err[:,1]):.3f} μm\n'
              f'最大误差: {err_r.max():.3f} μm')
-    ax3.text(0.02, 0.97, info3, transform=ax3.transAxes, va='top', fontsize=8,
-             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+    ax3.text(0.03, 0.95, info3, transform=ax3.transAxes, va='top', fontsize=7.5,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
 
-    # ── 子图4：误差圆分布 + CDF ──
+    # ── 子图4：误差圆分布 ──
     ax4 = fig.add_subplot(gs[3])
-    ax4_twin = ax4.twinx()
 
     theta = np.linspace(0, 2*np.pi, 200)
     colors = ['blue', 'green', 'red']
@@ -610,14 +600,7 @@ def viz_coordinate_transform(calibrator, ref_focal_um, rng, save=True):
     ax4.legend(fontsize=8, loc='upper right')
     ax4.grid(True, alpha=0.3)
 
-    # CDF曲线（右轴）
-    sorted_err = np.sort(err_r)
-    cdf = np.arange(1, len(sorted_err)+1) / len(sorted_err)
-    ax4_twin.plot([], [], 'purple', linestyle=':', linewidth=1.5, label='CDF')
-    ax4_twin.set_ylabel('累积概率', color='purple', fontsize=9)
-    ax4_twin.tick_params(axis='y', labelcolor='purple')
-
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.12, top=0.86, wspace=0.45)
     path = os.path.join(VIZ_DIR, "4_coordinate_transform.png")
     if save:
         plt.savefig(path, dpi=150, bbox_inches='tight')
@@ -640,7 +623,6 @@ def main(part=0):
     if part in (0, 1):
         spot, cx, cy = viz_spot(rng)
     else:
-        # 其他部分也需要spot数据
         patch_size = 60
         cx = patch_size/2 + 2.3
         cy = patch_size/2 - 1.7
@@ -673,4 +655,3 @@ if __name__ == "__main__":
                         help='0=全部, 1=光斑, 2=质心, 3=标定, 4=坐标变换')
     args = parser.parse_args()
     main(part=args.part)
-

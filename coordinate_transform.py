@@ -8,8 +8,8 @@
 """
 import numpy as np
 from numpy.polynomial import polynomial as P
-from config import (FOCAL_PLANE_SCALE_UM_PX, DISTORTION_POLY_DEGREE,
-                    PIXEL_SIZE_UM, DEMAGNIFICATION)
+from config import (FOCAL_PLANE_SCALE_UM_PX, POLY_ORDER,
+                    IMAGE_WIDTH, IMAGE_HEIGHT)
 
 
 # ============================================================
@@ -51,7 +51,7 @@ def poly_features(coords_norm, degree):
     return np.column_stack(features)
 
 
-def fit_distortion(affine_residuals_um, px_coords_norm, degree=DISTORTION_POLY_DEGREE):
+def fit_distortion(affine_residuals_um, px_coords_norm, degree=POLY_ORDER):
     F = poly_features(px_coords_norm, degree)
     coeff_x, _, _, _ = np.linalg.lstsq(F, affine_residuals_um[:, 0], rcond=None)
     coeff_y, _, _, _ = np.linalg.lstsq(F, affine_residuals_um[:, 1], rcond=None)
@@ -59,7 +59,7 @@ def fit_distortion(affine_residuals_um, px_coords_norm, degree=DISTORTION_POLY_D
 
 
 def apply_distortion_correction(px_coords_norm, coeff_x, coeff_y,
-                                degree=DISTORTION_POLY_DEGREE):
+                                degree=POLY_ORDER):
     F = poly_features(np.atleast_2d(px_coords_norm), degree)
     corr_x = F @ coeff_x
     corr_y = F @ coeff_y
@@ -81,7 +81,7 @@ class FVCCalibrator:
     focal_xy = cal.transform(target_px) # 变换待测光纤坐标
     """
 
-    def __init__(self, poly_degree=DISTORTION_POLY_DEGREE):
+    def __init__(self, poly_degree=POLY_ORDER):
         self.poly_degree = poly_degree
         self.A = None
         self.t = None
@@ -91,6 +91,9 @@ class FVCCalibrator:
         self.px_norm_offset = None
         self.is_calibrated = False
         self.calibration_report = {}
+        # 系统偏差补偿（消除标定残余的全局系统性偏移）
+        self.bias_x = 0.0
+        self.bias_y = 0.0
 
     def _normalize_px(self, px_coords):
         return (np.atleast_2d(px_coords) - self.px_norm_offset) / self.px_norm_scale
@@ -118,23 +121,77 @@ class FVCCalibrator:
         # *** 关键修复：先设为已标定，才能在下一步调用 self.transform() ***
         self.is_calibrated = True
 
-        # 4. 验证总体精度
+        # 4. 验证总体精度（此时 bias 尚未设置，transform 里 bias=0 不影响）
         final_pred = self.transform(ref_px)
         final_err = ref_focal_um - final_pred
         rms_final = float(np.sqrt(np.mean(final_err ** 2)))
 
+
+        # 5. Sigma-clipping：剔除离群基准点后重新标定
+        residuals_r = np.sqrt(np.sum(final_err ** 2, axis=1))
+        sigma = np.std(residuals_r)
+        mu = np.mean(residuals_r)
+        mask = residuals_r < mu + 3.0 * sigma  # 保留3σ以内的点
+        n_outliers = int(np.sum(~mask))
+
+        if n_outliers > 0 and np.sum(mask) >= max(10, self.poly_degree * 3):
+            # 用剩余点重新归一化
+            ref_px_clean = ref_px[mask]
+            ref_focal_clean = ref_focal_um[mask]
+
+            self.px_norm_offset = ref_px_clean.min(axis=0)
+            self.px_norm_scale = ref_px_clean.max(axis=0) - ref_px_clean.min(axis=0)
+            self.px_norm_scale = np.where(
+                self.px_norm_scale < 1e-6, 1.0, self.px_norm_scale)
+
+            # 重新仿射拟合
+            self.A, self.t = fit_affine(ref_px_clean, ref_focal_clean)
+            residuals_affine2, rms_affine = affine_residuals(
+                ref_px_clean, ref_focal_clean, self.A, self.t)
+
+            # 重新畸变拟合
+            px_norm_clean = self._normalize_px(ref_px_clean)
+            self.coeff_x, self.coeff_y = fit_distortion(
+                residuals_affine2, px_norm_clean, degree=self.poly_degree)
+
+            # 重新计算残差（用全部点评估，包括被剔除的点）
+            final_pred = self.transform(ref_px)
+            final_err = ref_focal_um - final_pred
+            rms_final = float(np.sqrt(np.mean(final_err ** 2)))
+
+            if verbose:
+                print(f"  Sigma-clipping: 剔除 {n_outliers} 个离群点"
+                      f"（阈值 μ+3σ = {mu + 3 * sigma:.3f} um），重新标定")
+        else:
+            if verbose and n_outliers == 0:
+                print(f"  Sigma-clipping: 无离群点，无需重新标定")
+
+        # 6. 计算并存储系统偏差
+        # final_err = ref_focal_um - final_pred，mean(final_err) 即为预测值的全局偏低量
+        #undefined() 里加上 bias，使基准点残差均值归零
+        self.bias_x = float(np.mean(final_err[:, 0]))
+        self.bias_y = float(np.mean(final_err[:, 1]))
+
+        # 7. 用补偿后的 transform 重新计算最终残差（用于报告）
+        final_pred_corrected = self.transform(ref_px)
+        final_err_corrected = ref_focal_um - final_pred_corrected
+        rms_final_corrected = float(np.sqrt(np.mean(final_err_corrected ** 2)))
+
         self.calibration_report = {
             'n_reference': N,
             'affine_rms_um': float(rms_affine),
-            'final_rms_um': float(rms_final),
+            'final_rms_um': rms_final_corrected,   # 使用偏差补偿后的残差
             'poly_degree': self.poly_degree,
+            'bias_x_um': self.bias_x,
+            'bias_y_um': self.bias_y,
         }
 
         if verbose:
             print(f"=== FVC 标定完成 ===")
             print(f"  基准光纤数: {N}")
             print(f"  仿射残差 RMS: {rms_affine:.3f} um")
-            print(f"  最终残差 RMS: {rms_final:.3f} um (含畸变校正)")
+            print(f"  最终残差 RMS: {rms_final_corrected:.3f} um (含畸变校正)")
+            print(f"  系统偏差:     X={self.bias_x:.3f} um, Y={self.bias_y:.3f} um")
 
         return self.calibration_report
 
@@ -146,6 +203,9 @@ class FVCCalibrator:
         correction = apply_distortion_correction(px_norm, self.coeff_x, self.coeff_y,
                                                  degree=self.poly_degree)
         focal += correction
+        # 补偿系统偏差（消除标定残余的全局系统性偏移）
+        focal[:, 0] += self.bias_x
+        focal[:, 1] += self.bias_y
         return focal
 
     def transform_with_uncertainty(self, px_coords, px_error_px=0.023):
@@ -196,4 +256,3 @@ if __name__ == "__main__":
     print(f"  RMS误差: {rms:.3f} um")
     print(f"  X方向RMS: {np.std(err[:, 0]):.3f} um")
     print(f"  Y方向RMS: {np.std(err[:, 1]):.3f} um")
-

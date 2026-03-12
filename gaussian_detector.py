@@ -8,6 +8,13 @@ from scipy.optimize import curve_fit, OptimizeWarning
 import warnings
 from config import SPOT_SIGMA_PX, FIT_WINDOW_SIGMA, MIN_SNR
 
+# photutils可选导入（安装后自动启用，未安装则降级到scipy）
+try:
+    from photutils.centroids import centroid_2dg
+    HAS_PHOTUTILS = True
+except ImportError:
+    HAS_PHOTUTILS = False
+
 
 # ============================================================
 # 高斯模型
@@ -76,7 +83,8 @@ def centroid_initial_guess(patch, background):
 # 主拟合函数
 # ============================================================
 
-def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
+def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
+                 use_photutils=True):
     """
     对patch进行2D高斯拟合
 
@@ -85,6 +93,7 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
     patch          : np.ndarray (H, W)  光斑图像patch
     sigma_init     : float  初始sigma估计（像素），None则用config值
     use_elliptical : bool   是否使用椭圆高斯（参数更多但更精确）
+    use_photutils  : bool   是否优先使用photutils（已安装时生效）
 
     Returns
     -------
@@ -103,11 +112,6 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
     # 初始质心
     cx_init, cy_init = centroid_initial_guess(patch, bg)
 
-    # 构建坐标网格
-    y_arr, x_arr = np.mgrid[0:H, 0:W]
-    xy = (x_arr.ravel().astype(float), y_arr.ravel().astype(float))
-    z = patch.ravel().astype(float)
-
     result = {
         'x0': cx_init, 'y0': cy_init,
         'sigma_x': sigma_init, 'sigma_y': sigma_init,
@@ -120,6 +124,38 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
         result['x0'] = cx_init
         result['y0'] = cy_init
         return result
+
+    # ── 优先尝试 photutils ────────────────────────────────
+    if use_photutils and HAS_PHOTUTILS and not use_elliptical:
+        try:
+            img = patch.astype(float)
+            x0, y0 = centroid_2dg(img)
+            # centroid_2dg返回nan表示失败
+            if np.isfinite(x0) and np.isfinite(y0):
+                peak = float(img.max())
+                bg_val = float(np.median(img))
+                result.update({
+                    'x0': float(x0),
+                    'y0': float(y0),
+                    'sigma_x': sigma_init,
+                    'sigma_y': sigma_init,
+                    'amplitude': peak - bg_val,
+                    'background': bg_val,
+                    'snr': snr,
+                    'residual_rms': 0.0,
+                    'success': True,
+                    'engine': 'photutils'
+                })
+                return result
+        except Exception:
+            pass  # photutils失败，降级到scipy
+    # ─────────────────────────────────────────────────────
+
+    # ── scipy实现（原有代码完全不变）─────────────────────
+    # 构建坐标网格
+    y_arr, x_arr = np.mgrid[0:H, 0:W]
+    xy = (x_arr.ravel().astype(float), y_arr.ravel().astype(float))
+    z = patch.ravel().astype(float)
 
     try:
         with warnings.catch_warnings():
@@ -140,8 +176,9 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
                     'amplitude': popt[0], 'x0': popt[1], 'y0': popt[2],
                     'sigma_x': abs(popt[3]), 'sigma_y': abs(popt[4]),
                     'theta': popt[5], 'background': popt[6],
-                    'x0_err': perr[2], 'y0_err': perr[3],  # perr[1]=x, perr[2]=y
-                    'success': True
+                    'x0_err': perr[2], 'y0_err': perr[3],
+                    'success': True,
+                    'engine': 'scipy_elliptical'
                 })
             else:
                 # 圆对称高斯（默认，更稳健）
@@ -164,7 +201,8 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
                     'background': popt[4],
                     'x0_err': perr[1], 'y0_err': perr[2],
                     'residual_rms': residual_rms,
-                    'success': True
+                    'success': True,
+                    'engine': 'scipy'
                 })
 
     except (RuntimeError, ValueError) as e:
@@ -174,8 +212,6 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False):
         result['fit_error'] = str(e)
 
     return result
-
-
 
 
 # ============================================================
@@ -255,7 +291,7 @@ class GaussianDetector:
 
 
 # ============================================================
-# 以下为新增内容：质心法 + 降级策略
+# 质心法 + 降级策略
 # ============================================================
 
 def centroid_weighted(patch, threshold_factor=0.3):
@@ -265,27 +301,17 @@ def centroid_weighted(patch, threshold_factor=0.3):
     精度低于高斯拟合（约差3-5倍），但速度快5-10倍，
     在高斯拟合失败时作为降级备选。
 
-    原理：
-        以像素强度（去背景后）为权重，计算强度重心坐标。
-        等价于一阶矩估计，对高斯分布理论上无偏。
-
     Parameters
     ----------
     patch            : 2D ndarray  光斑图像patch
     threshold_factor : float       0~1，去背景阈值比例
-                                   threshold = min + factor*(max-min)
 
     Returns
     -------
-    dict 包含：
-        x0      : float  质心x坐标（patch内，像素）
-        y0      : float  质心y坐标（patch内，像素）
-        success : bool   是否成功
-        method  : str    'centroid'
+    dict 包含 x0, y0, success, method
     """
     img = patch.astype(float)
 
-    # 去背景：低于阈值的像素权重置零
     img_min, img_max = img.min(), img.max()
     if img_max <= img_min:
         return {
@@ -323,8 +349,7 @@ def fit_with_fallback(patch, sigma_init=None):
     """
     带降级策略的质心检测
 
-    优先使用高斯拟合（精度高），失败时自动降级为加权质心法（鲁棒性强）。
-    适用于真实图像中部分光斑SNR较低、高斯拟合不收敛的情况。
+    优先使用高斯拟合，失败时自动降级为加权质心法。
 
     Parameters
     ----------
@@ -339,17 +364,16 @@ def fit_with_fallback(patch, sigma_init=None):
     if sigma_init is None:
         sigma_init = DEFAULT_SIGMA
 
-    # 优先高斯拟合
     result = fit_gaussian(patch, sigma_init=sigma_init)
     if result['success']:
         result['method'] = 'gaussian'
         return result
 
-    # 降级为质心法
     fallback = centroid_weighted(patch)
     if fallback['success']:
         print("  [降级] 高斯拟合失败，使用加权质心法")
     return fallback
+
 
 # ============================================================
 # 快速测试
@@ -359,12 +383,14 @@ if __name__ == "__main__":
     from spot_generator import generate_gaussian_spot
     import numpy as np
 
+    print(f"photutils 可用: {HAS_PHOTUTILS}")
+
     rng = np.random.default_rng(42)
 
-    # 在随机位置生成光斑，测试拟合精度
     N = 200
     errors_x, errors_y = [], []
     snrs = []
+    engine_counts = {}
 
     for _ in range(N):
         true_x = 24.0 + rng.uniform(-2, 2)
@@ -376,6 +402,8 @@ if __name__ == "__main__":
             errors_x.append(result['x0'] - true_x)
             errors_y.append(result['y0'] - true_y)
             snrs.append(result['snr'])
+            engine = result.get('engine', 'scipy')
+            engine_counts[engine] = engine_counts.get(engine, 0) + 1
 
     errors_x = np.array(errors_x)
     errors_y = np.array(errors_y)
@@ -392,5 +420,6 @@ if __name__ == "__main__":
     print(f"  Y方向 RMS: {rms_y:.4f} px")
     print(f"  合成 RMS:  {rms_r:.4f} px = {rms_um:.2f} μm (焦面)")
     print(f"  平均 SNR:  {np.mean(snrs):.1f}")
+    print(f"  引擎统计:  {engine_counts}")
     print(f"  目标精度:  {TARGET_ACCURACY_UM} μm → {'✓ 达标' if rms_um <= TARGET_ACCURACY_UM else '✗ 未达标'}")
 

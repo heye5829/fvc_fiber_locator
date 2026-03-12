@@ -1,6 +1,7 @@
 """
 仿真光斑生成器
 生成带噪声的高斯光斑，模拟FVC实际观测图像
+支持圆形和椭圆光斑
 """
 
 import numpy as np
@@ -14,20 +15,29 @@ def generate_gaussian_spot(center_x, center_y, image_size,
                            background=BACKGROUND_COUNTS,
                            read_noise=READ_NOISE_E,
                            add_noise=True,
-                           rng=None):
+                           rng=None,
+                           # 椭圆光斑参数（新增）
+                           sigma_x=None,
+                           sigma_y=None,
+                           theta=None,
+                           ellipticity_prob=None):
     """
-    生成单个高斯光斑图像patch
+    生成单个高斯光斑图像patch（支持椭圆）
 
     Parameters
     ----------
     center_x, center_y : float  光斑中心（像素，相对patch左上角）
     image_size         : int    patch边长（像素）
-    sigma              : float  高斯sigma（像素）
+    sigma              : float  高斯sigma（像素，圆形光斑时使用）
     peak               : float  峰值计数
     background         : float  背景计数
     read_noise         : float  读出噪声 e-
     add_noise          : bool   是否添加噪声
     rng                : np.random.Generator  随机数生成器
+    sigma_x            : float  X方向sigma（椭圆光斑，None时自动决定）
+    sigma_y            : float  Y方向sigma（椭圆光斑，None时自动决定）
+    theta              : float  椭圆旋转角（弧度，None时随机）
+    ellipticity_prob   : float  生成椭圆光斑的概率（0-1，None时使用config）
 
     Returns
     -------
@@ -36,10 +46,41 @@ def generate_gaussian_spot(center_x, center_y, image_size,
     if rng is None:
         rng = np.random.default_rng(RANDOM_SEED)
 
+    if ellipticity_prob is None:
+        ellipticity_prob = ELLIPTICAL_SPOT_PROB
+
+    # 决定是否生成椭圆光斑
+    is_elliptical = rng.random() < ellipticity_prob
+
+    if sigma_x is None:
+        sigma_x = sigma
+
+    if sigma_y is None:
+        if is_elliptical:
+            # 椭圆率在配置范围内随机
+            ellipticity = rng.uniform(*ELLIPTICITY_RANGE)
+            sigma_y = sigma_x * ellipticity
+        else:
+            sigma_y = sigma_x  # 圆形
+
+    if theta is None:
+        if is_elliptical:
+            theta = rng.uniform(0, np.pi)
+        else:
+            theta = 0.0  # 圆形时theta无意义
+
     y, x = np.mgrid[0:image_size, 0:image_size].astype(float)
 
-    # 2D高斯
-    exponent = -((x - center_x) ** 2 + (y - center_y) ** 2) / (2 * sigma ** 2)
+    # 椭圆高斯公式
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    a = (cos_t ** 2) / (2 * sigma_x ** 2) + (sin_t ** 2) / (2 * sigma_y ** 2)
+    b = -(np.sin(2 * theta)) / (4 * sigma_x ** 2) + (np.sin(2 * theta)) / (4 * sigma_y ** 2)
+    c = (sin_t ** 2) / (2 * sigma_x ** 2) + (cos_t ** 2) / (2 * sigma_y ** 2)
+
+    dx = x - center_x
+    dy = y - center_y
+    exponent = -(a * dx ** 2 + 2 * b * dx * dy + c * dy ** 2)
     signal = peak * np.exp(exponent) + background
 
     if add_noise:
@@ -128,4 +169,3 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig('test_spot.png', dpi=150)
     print("已保存 test_spot.png")
-
