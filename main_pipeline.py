@@ -626,7 +626,19 @@ def run_measurement(calibrator, ref_focal_um, n_targets=None, rng=None,verbose=T
         'max_err_um': max_err,
         'p95_err_um': p95_err,
         'target_accuracy_um': TARGET_ACCURACY_UM,
-        'pass': rms_r <= TARGET_ACCURACY_UM,}
+        'pass': rms_r <= TARGET_ACCURACY_UM,
+    }
+
+    # ──────────────────────────────────────────────────────
+    # 新增：生成完整结果表
+    # ──────────────────────────────────────────────────────
+    result_table = _build_result_table(
+        target_focal_true, target_px_true,
+        target_px_detected, target_focal_predicted,
+        success_mask
+    )
+    _save_result_table(result_table)
+    _plot_result_figures(result_table, rms_r, p95_err)
 
     if verbose:
         print(f"\n  ── 测量精度统计 (N={n_success}) ──")
@@ -681,7 +693,7 @@ def run_measurement(calibrator, ref_focal_um, n_targets=None, rng=None,verbose=T
     plt.close()
     print(f"  精度分布图已保存: {fig_path}")
 
-    return stats, err
+    return stats, err, result_table
 
 
 # ============================================================
@@ -766,7 +778,7 @@ def main(mode='full'):
 
     # 步骤3：测量精度评估
     if mode in ['full', 'measurement']:
-        measurement_stats, _ = run_measurement(
+        measurement_stats, _, result_table = run_measurement(
             calibrator, ref_focal_um,
             n_targets=NUM_TARGET_FIBERS,
             rng=rng,
@@ -792,7 +804,208 @@ def main(mode='full'):
         status = "✓ 系统达标" if measurement_stats['pass'] else "✗ 系统未达标"
         print(f"  综合评估:          {status}")
 
+    # ── 重标定状态检查 ────────────────────────────────────────────
+    if mode in ['full', 'calibration', 'measurement']:
+        print(f"\n{'='*60}")
+        print(f"  重标定状态检查")
+        print(f"{'='*60}")
+        recal_check = calibrator.check_recalibration_needed(
+            ref_px_detected,
+            ref_focal_um,
+            rms_threshold_um=2.0,
+            bias_threshold_um=5.0,
+            verbose=True
+        )
+        if recal_check['need_recalibration']:
+            print(f"\n  [建议] 执行: {recal_check['recalibration_type']}")
+            print(f"  [说明] 当前标定状态不满足精度要求，")
+            print(f"         请重新采集基准光纤图像并执行重标定。")
+        else:
+            print(f"\n  [确认] 当前标定状态良好，无需重标定。")
+
     print("\n完成！")
+
+# ============================================================
+# 结果表生成、保存与可视化（新增）
+# ============================================================
+
+def _build_result_table(target_focal_true, target_px_true,
+                        target_px_detected, target_focal_predicted,
+                        success_mask):
+    """构建完整结果表
+
+    Parameters
+    ----------
+    target_focal_true      : (N,2) 焦面真值坐标 (μm)
+    target_px_true         : (N,2) 像素坐标真值
+    target_px_detected     : (N,2) 像素坐标检测值
+    target_focal_predicted : (N,2) 焦面预测坐标 (μm)
+    success_mask           : (N,)  检测成功掩码
+
+    Returns
+    -------
+    table : list of dict  每行对应一根光纤的完整结果
+    """
+    table = []
+    N = len(target_focal_true)
+
+    for i in range(N):
+        row = {
+            'fiber_id':      i,
+            'u_px':          float(target_px_detected[i, 0]),   # 检测像素坐标 X
+            'v_px':          float(target_px_detected[i, 1]),   # 检测像素坐标 Y
+            'X_true_um':     float(target_focal_true[i, 0]),    # 焦面真值 X (μm)
+            'Y_true_um':     float(target_focal_true[i, 1]),    # 焦面真值 Y (μm)
+            'X_meas_um':     float(target_focal_predicted[i, 0]),  # 焦面测量值 X (μm)
+            'Y_meas_um':     float(target_focal_predicted[i, 1]),  # 焦面测量值 Y (μm)
+            'dX_um':         float(target_focal_true[i, 0] - target_focal_predicted[i, 0]),
+            'dY_um':         float(target_focal_true[i, 1] - target_focal_predicted[i, 1]),
+            'radial_err_um': float(np.sqrt(
+                                (target_focal_true[i, 0] - target_focal_predicted[i, 0])**2 +
+                                (target_focal_true[i, 1] - target_focal_predicted[i, 1])**2
+                             )),
+            'detect_success': bool(success_mask[i]),
+        }
+        table.append(row)
+
+    return table
+
+
+def _save_result_table(table):
+    """保存结果表为 CSV 和 JSON 两种格式
+
+    CSV 格式便于 Excel 打开查看；
+    JSON 格式便于程序读取。
+
+    Parameters
+    ----------
+    table : list of dict  _build_result_table 的返回值
+    """
+    import csv
+
+    # ── CSV ──────────────────────────────────────────────
+    csv_path = os.path.join(OUTPUT_DIR, "results", "fiber_positions.csv")
+    fieldnames = [
+        'fiber_id',
+        'u_px', 'v_px',
+        'X_true_um', 'Y_true_um',
+        'X_meas_um', 'Y_meas_um',
+        'dX_um', 'dY_um',
+        'radial_err_um',
+        'detect_success',
+    ]
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(table)
+    print(f"\n  结果表 CSV 已保存: {csv_path}")
+
+    # ── JSON ─────────────────────────────────────────────
+    json_path = os.path.join(OUTPUT_DIR, "results", "fiber_positions.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(table, f, indent=2, ensure_ascii=False)
+    print(f"  结果表 JSON 已保存: {json_path}")
+
+    # ── 打印前10行预览 ───────────────────────────────────
+    print("\n  ── 结果表预览（前10行）──")
+    header = (f"{'ID':>4}  {'u(px)':>8}  {'v(px)':>8}  "
+              f"{'X_true':>10}  {'Y_true':>10}  "
+              f"{'X_meas':>10}  {'Y_meas':>10}  "
+              f"{'dX(μm)':>8}  {'dY(μm)':>8}  {'r_err(μm)':>10}")
+    print("  " + header)
+    print("  " + "-" * len(header))
+    for row in table[:10]:
+        line = (f"  {row['fiber_id']:>4}  "
+                f"{row['u_px']:>8.2f}  {row['v_px']:>8.2f}  "
+                f"{row['X_true_um']:>10.2f}  {row['Y_true_um']:>10.2f}  "
+                f"{row['X_meas_um']:>10.2f}  {row['Y_meas_um']:>10.2f}  "
+                f"{row['dX_um']:>8.3f}  {row['dY_um']:>8.3f}  "
+                f"{row['radial_err_um']:>10.3f}")
+        print(line)
+    print(f"  ... (共 {len(table)} 行)")
+
+
+def _plot_result_figures(table, rms_r, p95_err):
+    """生成结果可视化图（两张）
+
+    图1：焦面坐标散点图（测量值分布）
+    图2：XY 误差矢量图
+
+    Parameters
+    ----------
+    table   : list of dict  结果表
+    rms_r   : float         径向误差 RMS (μm)
+    p95_err : float         95% 分位误差 (μm)
+    """
+    # 提取数据
+    X_true  = np.array([r['X_true_um']     for r in table]) / 1000   # μm → mm
+    Y_true  = np.array([r['Y_true_um']     for r in table]) / 1000
+    X_meas  = np.array([r['X_meas_um']     for r in table]) / 1000
+    Y_meas  = np.array([r['Y_meas_um']     for r in table]) / 1000
+    dX      = np.array([r['dX_um']         for r in table])           # μm
+    dY      = np.array([r['dY_um']         for r in table])
+    r_err   = np.array([r['radial_err_um'] for r in table])
+
+    # ── 图1：焦面测量值散点图 ────────────────────────────
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+
+    sc = ax.scatter(X_meas, Y_meas,
+                    c=r_err, cmap='RdYlGn_r',
+                    s=20, alpha=0.7, vmin=0, vmax=p95_err * 1.5)
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label('径向误差 (μm)')
+
+    ax.set_xlabel('焦面 X (mm)')
+    ax.set_ylabel('焦面 Y (mm)')
+    ax.set_title(f'焦面坐标测量结果（{len(table)} 根光纤）\n'
+                 f'RMS={rms_r:.3f} μm  P95={p95_err:.3f} μm')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    fig_path1 = os.path.join(OUTPUT_DIR, "figures", "focal_xy_result.png")
+    plt.tight_layout()
+    plt.savefig(fig_path1, dpi=150)
+    plt.close()
+    print(f"\n  焦面坐标散点图已保存: {fig_path1}")
+
+    # ── 图2：XY 误差矢量图 ───────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # 左：矢量图（颜色=误差大小）
+    ax = axes[0]
+    q = ax.quiver(X_true, Y_true, dX, dY, r_err,
+                  cmap='RdYlGn_r', alpha=0.8,
+                  width=0.003, scale=None)
+    plt.colorbar(q, ax=ax, label='径向误差 (μm)')
+    ax.set_xlabel('焦面 X (mm)')
+    ax.set_ylabel('焦面 Y (mm)')
+    ax.set_title(f'XY 误差矢量图\n箭头方向=误差方向，颜色=误差大小')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    # 右：dX vs dY 散点图
+    ax = axes[1]
+    theta = np.linspace(0, 2 * np.pi, 300)
+    ax.plot(rms_r * np.cos(theta), rms_r * np.sin(theta),
+            'b--', linewidth=2, label=f'RMS = {rms_r:.3f} μm')
+    ax.plot(p95_err * np.cos(theta), p95_err * np.sin(theta),
+            'r-', linewidth=2, label=f'P95 = {p95_err:.3f} μm')
+    ax.plot(TARGET_ACCURACY_UM * np.cos(theta),
+            TARGET_ACCURACY_UM * np.sin(theta),
+            'g:', linewidth=2, label=f'目标 = {TARGET_ACCURACY_UM} μm')
+    ax.scatter(dX, dY, s=12, alpha=0.4, color='steelblue')
+    ax.set_xlabel('dX (μm)')
+    ax.set_ylabel('dY (μm)')
+    ax.set_title('误差分布（焦面坐标系）')
+    ax.legend(loc='upper right', fontsize=9)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    fig_path2 = os.path.join(OUTPUT_DIR, "figures", "xy_error_vector.png")
+    plt.tight_layout()
+    plt.savefig(fig_path2, dpi=150)
+    plt.close()
+    print(f"  XY 误差矢量图已保存: {fig_path2}")
 
 
 if __name__ == "__main__":
