@@ -83,10 +83,9 @@ def centroid_initial_guess(patch, background):
 # 主拟合函数
 # ============================================================
 
-def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
-                 use_photutils=True):
+def fit_gaussian(patch, sigma_init=None, use_elliptical=False, use_photutils=True):
     """
-    对patch进行2D高斯拟合
+    对patch进行2D高斯拟合（增强版：加入倾斜平面背景补偿，冲击 0.02 px 精度）
 
     Parameters
     ----------
@@ -97,8 +96,15 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
 
     Returns
     -------
-    result : dict  包含 x0, y0, sigma, amplitude, background, snr, success
+    result : dict  包含 x0, y0, sigma_x, sigma_y, amplitude, background, snr, success
+
+    【修改说明】:
+    1. 修复了 warnings 作用域导致的 UnboundLocalError
+    2. 在 scipy 拟合分支中加入了倾斜平面背景模型 (bg_x*x + bg_y*y + bg_const)
+    3. 保持了与原代码完全一致的函数签名和返回格式，确保兼容性
     """
+    import warnings  # 局部导入，彻底避免作用域问题
+
     if sigma_init is None:
         sigma_init = SPOT_SIGMA_PX
 
@@ -129,30 +135,40 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
     if use_photutils and HAS_PHOTUTILS and not use_elliptical:
         try:
             img = patch.astype(float)
-            x0, y0 = centroid_2dg(img)
-            # centroid_2dg返回nan表示失败
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The fit may not have converged.*")
+                x0, y0 = centroid_2dg(img)
+
             if np.isfinite(x0) and np.isfinite(y0):
                 peak = float(img.max())
                 bg_val = float(np.median(img))
+                amp_val = peak - bg_val
+
+                ok = is_valid_centroid_result(
+                    x0, y0, img.shape,
+                    amplitude=amp_val,
+                    snr=snr,
+                    sigma=sigma_init
+                )
+
                 result.update({
                     'x0': float(x0),
                     'y0': float(y0),
                     'sigma_x': sigma_init,
                     'sigma_y': sigma_init,
-                    'amplitude': peak - bg_val,
+                    'amplitude': amp_val,
                     'background': bg_val,
                     'snr': snr,
                     'residual_rms': 0.0,
-                    'success': True,
                     'engine': 'photutils'
                 })
+                result['success'] = is_valid_fit_result(result, patch.shape)
                 return result
         except Exception:
-            pass  # photutils失败，降级到scipy
-    # ─────────────────────────────────────────────────────
+            pass
 
-    # ── scipy实现（原有代码完全不变）─────────────────────
-    # 构建坐标网格
+    # ── scipy实现（增强版：加入倾斜平面背景补偿）─────────────────────
     y_arr, x_arr = np.mgrid[0:H, 0:W]
     xy = (x_arr.ravel().astype(float), y_arr.ravel().astype(float))
     z = patch.ravel().astype(float)
@@ -162,7 +178,7 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
             warnings.simplefilter("ignore", OptimizeWarning)
 
             if use_elliptical:
-                # 椭圆高斯
+                # 椭圆高斯（保持原逻辑不变）
                 p0 = [amplitude_init, cx_init, cy_init,
                       sigma_init, sigma_init, 0.0, bg]
                 bounds = (
@@ -176,34 +192,50 @@ def fit_gaussian(patch, sigma_init=None, use_elliptical=False,
                     'amplitude': popt[0], 'x0': popt[1], 'y0': popt[2],
                     'sigma_x': abs(popt[3]), 'sigma_y': abs(popt[4]),
                     'theta': popt[5], 'background': popt[6],
-                    'x0_err': perr[2], 'y0_err': perr[3],
-                    'success': True,
+                    'x0_err': perr[1], 'y0_err': perr[2],
                     'engine': 'scipy_elliptical'
                 })
+                result['success'] = is_valid_fit_result(result, patch.shape)
+
             else:
-                # 圆对称高斯（默认，更稳健）
-                p0 = [amplitude_init, cx_init, cy_init, sigma_init, bg]
+                # ★★★ 圆对称高斯 + 倾斜平面背景（核心改进）★★★
+                # 新模型: A*exp(...) + bg_x*x + bg_y*y + bg_const
+                def gaussian_2d_sym_with_plane(coords, amplitude, xo, yo, sigma, bg_x, bg_y, bg_const):
+                    x_c, y_c = coords
+                    g = amplitude * np.exp(-((x_c - xo) ** 2 + (y_c - yo) ** 2) / (2 * sigma ** 2))
+                    plane = bg_x * x_c + bg_y * y_c + bg_const
+                    return g + plane
+
+                # 初值：[振幅, x中心, y中心, sigma, X梯度, Y梯度, 常数背景]
+                p0 = [amplitude_init, cx_init, cy_init, sigma_init, 0.0, 0.0, bg]
+
+                # 边界约束
                 bounds = (
-                    [0, 0, 0, 0.5, 0],
-                    [amplitude_init * 3, W, H, sigma_init * 5, bg * 3 + 100]
+                    [0, 0, 0, 0.5, -np.inf, -np.inf, 0],
+                    [amplitude_init * 3, W, H, sigma_init * 5, np.inf, np.inf, bg * 3 + 100]
                 )
-                popt, pcov = curve_fit(gaussian_2d_sym, xy, z, p0=p0,
+
+                popt, pcov = curve_fit(gaussian_2d_sym_with_plane, xy, z, p0=p0,
                                        bounds=bounds, maxfev=2000)
                 perr = np.sqrt(np.diag(pcov))
 
                 # 拟合残差
-                z_fit = gaussian_2d_sym(xy, *popt)
+                z_fit = gaussian_2d_sym_with_plane(xy, *popt)
                 residual_rms = float(np.sqrt(np.mean((z - z_fit) ** 2)))
 
                 result.update({
-                    'amplitude': popt[0], 'x0': popt[1], 'y0': popt[2],
-                    'sigma_x': popt[3], 'sigma_y': popt[3],
-                    'background': popt[4],
-                    'x0_err': perr[1], 'y0_err': perr[2],
+                    'amplitude': popt[0],
+                    'x0': popt[1],
+                    'y0': popt[2],
+                    'sigma_x': popt[3],
+                    'sigma_y': popt[3],
+                    'background': popt[6],  # 使用常数项作为背景
+                    'x0_err': perr[1],
+                    'y0_err': perr[2],
                     'residual_rms': residual_rms,
-                    'success': True,
-                    'engine': 'scipy'
+                    'engine': 'scipy_enhanced'
                 })
+                result['success'] = is_valid_fit_result(result, patch.shape)
 
     except (RuntimeError, ValueError) as e:
         # 拟合失败，回退到质心法
@@ -230,10 +262,13 @@ class GaussianDetector:
 
     def __init__(self, window_sigma=FIT_WINDOW_SIGMA,
                  spot_sigma=SPOT_SIGMA_PX,
-                 use_elliptical=False):
+                 # use_elliptical=False):
+                 use_elliptical=False,
+                 use_photutils=False):  #  新增参数，默认关闭 photutils
         self.half_win = int(np.ceil(window_sigma * spot_sigma)) + 1
         self.spot_sigma = spot_sigma
         self.use_elliptical = use_elliptical
+        self.use_photutils = use_photutils  #  保存为实例变量
 
     def detect_single(self, image, seed_x, seed_y):
         """
@@ -256,7 +291,9 @@ class GaussianDetector:
             return {'x_global': seed_x, 'y_global': seed_y, 'success': False}
 
         result = fit_gaussian(patch, sigma_init=self.spot_sigma,
-                              use_elliptical=self.use_elliptical)
+                              # use_elliptical=self.use_elliptical)
+                              use_elliptical=self.use_elliptical,
+                              use_photutils=self.use_photutils)  #  传入参数
 
         # 转回全图坐标
         result['x_global'] = result['x0'] + off_x
@@ -375,6 +412,63 @@ def fit_with_fallback(patch, sigma_init=None):
     return fallback
 
 
+def is_valid_centroid_result(x0, y0, patch_shape, amplitude=None, snr=None, sigma=None):
+    H, W = patch_shape
+
+    if not (np.isfinite(x0) and np.isfinite(y0)):
+        return False
+
+    # 质心必须落在patch内部
+    if not (0.0 <= x0 < W and 0.0 <= y0 < H):
+        return False
+
+    # 振幅必须合理
+    if amplitude is not None and amplitude <= 0:
+        return False
+
+    # SNR太低不认为是可靠拟合
+    if snr is not None and snr < MIN_SNR * 0.5:
+        return False
+
+    # sigma如果给了，也做个宽松检查
+    if sigma is not None and not (0.5 <= sigma <= 5.0 * SPOT_SIGMA_PX):
+        return False
+
+    return True
+
+
+def is_valid_fit_result(result, patch_shape):
+    H, W = patch_shape
+    x0 = result.get("x0", np.nan)
+    y0 = result.get("y0", np.nan)
+    amp = result.get("amplitude", np.nan)
+    snr = result.get("snr", np.nan)
+    sigma_x = result.get("sigma_x", np.nan)
+    sigma_y = result.get("sigma_y", np.nan)
+
+    # 1) 坐标必须有效
+    if not (np.isfinite(x0) and np.isfinite(y0)):
+        return False
+
+    # 2) 质心必须落在 patch 内
+    if not (0.0 <= x0 < W and 0.0 <= y0 < H):
+        return False
+
+    # 3) 振幅必须为正
+    if not np.isfinite(amp) or amp <= 0:
+        return False
+
+    # 4) SNR 太低不通过
+    if not np.isfinite(snr) or snr < MIN_SNR * 0.5:
+        return False
+
+    # 5) sigma 太离谱不通过
+    if np.isfinite(sigma_x) and not (0.3 <= sigma_x <= 5.0 * SPOT_SIGMA_PX):
+        return False
+    if np.isfinite(sigma_y) and not (0.3 <= sigma_y <= 5.0 * SPOT_SIGMA_PX):
+        return False
+
+    return True
 # ============================================================
 # 快速测试
 # ============================================================

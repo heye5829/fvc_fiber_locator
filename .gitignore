@@ -1,60 +1,51 @@
-# ============================================
 # Python
-# ============================================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
+.Python
+env/
+venv/
+ENV/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# ============================================
 # IDE
-# ============================================
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
 
-# ============================================
-# Jupyter Notebook
-# ============================================
-.ipynb_checkpoints/
-*.ipynb
+# 运行结果（不上传）
+outputs/figures/*.png
+outputs/figures/visualization/*.png
+outputs/results/*.json
 
-# ============================================
-# 项目输出文件
-# ============================================
-# 所有输出目录
-outputs/
+# 数据集图像（太大，不上传）
+dataset/images/*.npy
 
-# 测试生成的图片
-test_spot.png
-
-# 如果想保留示例图片，取消下面这行的注释
-# !outputs/examples/
-
-# ============================================
-# 环境配置
-# ============================================
-.env
-.venv
-env/
-venv/
-ENV/
-
-# ============================================
-# 系统文件
-# ============================================
+# 临时文件
+*.log
+*.tmp
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# ============================================
-# 日志文件
-# ============================================
-*.log
+# 保留目录结构（上传空文件夹）
+!outputs/figures/.gitkeep
+!outputs/figures/visualization/.gitkeep
+!outputs/results/.gitkeep
+!dataset/images/.gitkeep

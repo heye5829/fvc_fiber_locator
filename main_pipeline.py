@@ -54,30 +54,47 @@ def ensure_output_dir():
     os.makedirs(os.path.join(OUTPUT_DIR, "results"), exist_ok=True)
 
 
-def build_reference_grid(n_side=REF_GRID_SIDE,
-                         spacing_mm=REFERENCE_GRID_SPACING_MM,
-                         origin_mm=REFERENCE_GRID_ORIGIN_MM):
-    """构建基准光纤焦面坐标（规则格网）
+# def build_reference_grid(n_side=REF_GRID_SIDE,
+#                          spacing_mm=REFERENCE_GRID_SPACING_MM,
+#                          origin_mm=REFERENCE_GRID_ORIGIN_MM):
+#     """构建基准光纤焦面坐标（规则格网）
+#
+#     Parameters
+#     ----------
+#     n_side      : int    格网边长（n×n）
+#     spacing_mm  : float  光纤间距 (mm)
+#     origin_mm   : tuple  格网原点 (x, y) mm
+#
+#     Returns
+#     -------
+#     ref_focal : (N, 2) array  基准光纤焦面坐标 (μm)
+#     """
+#     ref_focal = []
+#     ox = origin_mm[0] * 1000  # mm → μm
+#     oy = origin_mm[1] * 1000
+#     spacing_um = spacing_mm * 1000
+#     for i in range(n_side):
+#         for j in range(n_side):
+#             ref_focal.append([ox + i * spacing_um, oy + j * spacing_um])
+#     return np.array(ref_focal, dtype=float)
 
-    Parameters
-    ----------
-    n_side      : int    格网边长（n×n）
-    spacing_mm  : float  光纤间距 (mm)
-    origin_mm   : tuple  格网原点 (x, y) mm
-
-    Returns
-    -------
-    ref_focal : (N, 2) array  基准光纤焦面坐标 (μm)
+def build_reference_grid(n_side=REF_GRID_SIDE, fixed_range=300.0):
     """
-    ref_focal = []
-    ox = origin_mm[0] * 1000  # mm → μm
-    oy = origin_mm[1] * 1000
-    spacing_um = spacing_mm * 1000
-    for i in range(n_side):
-        for j in range(n_side):
-            ref_focal.append([ox + i * spacing_um, oy + j * spacing_um])
-    return np.array(ref_focal, dtype=float)
+    生成基准光纤格网
 
+    Parameters:
+    - n_side: 格网边长（点数）
+    - fixed_range: 固定覆盖范围 (mm)，默认 300×300 mm
+    """
+    # 固定范围，调整间距
+    spacing = fixed_range / (n_side - 1)
+
+    x_range = np.linspace(-fixed_range / 2, fixed_range / 2, n_side)
+    y_range = np.linspace(-fixed_range / 2, fixed_range / 2, n_side)
+    xx, yy = np.meshgrid(x_range, y_range)
+
+    positions = np.column_stack([xx.ravel(), yy.ravel()]) * 1000  # mm → μm
+    return positions
 
 def focal_to_pixel(focal_um, scale=None, rotation_deg=0.5,
                    offset_px=None):   # 改为None，动态计算    (3000.0, 2500.0)):
@@ -251,7 +268,8 @@ def run_detection_accuracy_test(n_trials=500, verbose=True):
 # 步骤2：标定流程
 # ============================================================
 
-def run_calibration(rng, verbose=True):
+# def run_calibration(rng, verbose=True):
+def run_calibration(rng, n_side=REF_GRID_SIDE, verbose=True):
     """用基准光纤标定 FVC 坐标变换模型（3阶多项式）
 
     Parameters
@@ -271,18 +289,31 @@ def run_calibration(rng, verbose=True):
     print("=" * 50)
 
     # 构建基准光纤焦面坐标
-    ref_focal_um = build_reference_grid(n_side=REF_GRID_SIDE)
+    # ref_focal_um = build_reference_grid(n_side=REF_GRID_SIDE)
+    # 改为（支持动态测试）
+    ref_focal_um = build_reference_grid(n_side=n_side)  # n_side 作为参数传入
     N_ref = len(ref_focal_um)
+
+    #  新增：自适应选择多项式阶数
+    if N_ref < 30:
+        poly_degree = 3
+    elif N_ref < 80:
+        poly_degree = 4
+    else:
+        poly_degree = 5
+
     spacing_um = REFERENCE_GRID_SPACING_MM * 1000
     coverage_mm = (REF_GRID_SIDE - 1) * REFERENCE_GRID_SPACING_MM
 
     # 计算参数比（3阶多项式每方向10个参数）
-    n_params_per_dim = (DISTORTION_DEGREE + 1) * (DISTORTION_DEGREE + 2) // 2
+    # n_params_per_dim = (DISTORTION_DEGREE + 1) * (DISTORTION_DEGREE + 2) // 2
+    n_params_per_dim = (poly_degree + 1) * (poly_degree + 2) // 2  #  使用自适应阶数
     param_ratio = (N_ref * 2) / (n_params_per_dim * 2)
 
     print(f"  基准光纤数: {N_ref}  ({REF_GRID_SIDE}x{REF_GRID_SIDE} 格网)")
     print(f"  间距: {REFERENCE_GRID_SPACING_MM} mm，覆盖范围: {coverage_mm}x{coverage_mm} mm")
-    print(f"  多项式阶数: {DISTORTION_DEGREE}  (参数比 ≈ {param_ratio:.1f}:1)")
+    # print(f"  多项式阶数: {DISTORTION_DEGREE}  (参数比 ≈ {param_ratio:.1f}:1)")
+    print(f"  多项式阶数: {poly_degree}  (参数比 ≈ {param_ratio:.1f}:1)")  #  显示自适应阶数
 
     # # 焦面坐标 → 像素坐标（含畸变）
     # ref_px_ideal = focal_to_pixel(ref_focal_um)
@@ -315,7 +346,9 @@ def run_calibration(rng, verbose=True):
     ref_px_detected = np.array(ref_px_detected)
 
     # 执行标定
-    calibrator = FVCCalibrator(poly_degree=DISTORTION_DEGREE)
+    # calibrator = FVCCalibrator(poly_degree=DISTORTION_DEGREE)
+    # 执行标定（使用自适应阶数）
+    calibrator = FVCCalibrator(poly_degree=poly_degree)  #  传入自适应阶数
     calib_report = calibrator.calibrate(ref_px_detected, ref_focal_um, verbose=verbose)
 
     # 加这两行调试
@@ -736,7 +769,6 @@ def save_report(detection_stats, calib_report, measurement_stats):
 # ============================================================
 # 主流程
 # ============================================================
-
 def main(mode='full'):
     """主流程入口
 
@@ -747,9 +779,26 @@ def main(mode='full'):
         'detection' - 仅步骤1（检测精度测试）
         'calibration' - 仅步骤2（标定）
         'measurement' - 步骤2+3（标定+测量）
+        'hybrid_test' - 混合方法测试（Poly + RBF）
     """
     ensure_output_dir()
 
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    # ============================================================
+    # 模式1：混合方法测试
+    # ============================================================
+    if mode == 'hybrid_test':
+        print("╔══════════════════════════════════════════════════╗")
+        print("║   混合方法测试（Poly + RBF）                    ║")
+        print("╚══════════════════════════════════════════════════╝")
+        test_hybrid_method(rng, n_side=11, verbose=True)
+        print("\n完成！")
+        return
+
+    # ============================================================
+    # 其他模式：原有流程
+    # ============================================================
     # 打印系统信息
     print("╔══════════════════════════════════════════════════╗")
     print("║   MUST望远镜 FVC 光纤位置测量系统               ║")
@@ -761,8 +810,6 @@ def main(mode='full'):
     print(f"  畸变模型: {DISTORTION_DEGREE} 阶多项式")
     print(f"  畸变系数: k1={DISTORTION_K1}, k2={DISTORTION_K2}")
 
-    rng = np.random.default_rng(RANDOM_SEED)
-
     # 步骤1：检测精度测试
     if mode in ['full', 'detection']:
         detection_stats, _, _ = run_detection_accuracy_test(n_trials=500, verbose=True)
@@ -771,7 +818,13 @@ def main(mode='full'):
 
     # 步骤2：标定
     if mode in ['full', 'calibration', 'measurement']:
-        calibrator, ref_focal_um, ref_px_detected, calib_report = run_calibration(rng, verbose=True)
+        for n_side in [5, 7, 9, 11]:
+            print(f"\n{'=' * 60}")
+            print(f"测试基准格网: {n_side}x{n_side} = {n_side ** 2} 个基准点")
+            print(f"{'=' * 60}")
+            calibrator, ref_focal_um, ref_px_detected, calib_report = run_calibration(rng, n_side=n_side, verbose=True)
+            measurement_stats, _, _ = run_measurement(calibrator, ref_focal_um, n_targets=500, rng=rng, verbose=True)
+            print(f"端到端 RMSE: {measurement_stats['rms_r_um']:.3f} μm")
     else:
         print("\n跳过标定步骤")
         return
@@ -804,11 +857,11 @@ def main(mode='full'):
         status = "✓ 系统达标" if measurement_stats['pass'] else "✗ 系统未达标"
         print(f"  综合评估:          {status}")
 
-    # ── 重标定状态检查 ────────────────────────────────────────────
+    # 重标定状态检查
     if mode in ['full', 'calibration', 'measurement']:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  重标定状态检查")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         recal_check = calibrator.check_recalibration_needed(
             ref_px_detected,
             ref_focal_um,
@@ -824,6 +877,9 @@ def main(mode='full'):
             print(f"\n  [确认] 当前标定状态良好，无需重标定。")
 
     print("\n完成！")
+
+
+
 
 # ============================================================
 # 结果表生成、保存与可视化（新增）
@@ -1008,10 +1064,167 @@ def _plot_result_figures(table, rms_r, p95_err):
     print(f"  XY 误差矢量图已保存: {fig_path2}")
 
 
+def test_hybrid_method(rng, n_side=11, verbose=True):
+    """
+    测试混合方法（Poly + RBF）vs 纯多项式
+    """
+    from hybrid_calibrator import HybridCalibrator
+
+    print("\n" + "=" * 60)
+    print(f"对比测试: {n_side}x{n_side} = {n_side ** 2} 个基准点")
+    print("=" * 60)
+
+    # 生成基准点
+    ref_focal_um = build_reference_grid(n_side=n_side)
+    ref_px_ideal = focal_to_pixel(ref_focal_um)
+
+    # 仿真检测基准点
+    ref_px_detected = []
+    for px, py in ref_px_ideal:
+        patch_size = 50
+        true_cx = patch_size / 2 + (px - round(px))
+        true_cy = patch_size / 2 + (py - round(py))
+        patch = generate_gaussian_spot(
+            true_cx, true_cy,
+            image_size=patch_size,
+            rng=rng,
+            ellipticity_prob=ELLIPTICAL_SPOT_PROB
+        )
+        result = fit_gaussian(patch, sigma_init=SPOT_SIGMA_PX, use_elliptical=True)
+        if result['success']:
+            offset_x = round(px) - patch_size // 2
+            offset_y = round(py) - patch_size // 2
+            detected_x = result['x0'] + offset_x
+            detected_y = result['y0'] + offset_y
+            ref_px_detected.append([detected_x, detected_y])
+        else:
+            ref_px_detected.append([px, py])
+    ref_px_detected = np.array(ref_px_detected)
+
+    # ============================================================
+    # 方法1：纯多项式（5阶）
+    # ============================================================
+    print("\n[方法1] 纯多项式（5阶）")
+    calibrator_poly = FVCCalibrator(poly_degree=5)
+    calib_report_poly = calibrator_poly.calibrate(
+        ref_px_detected,
+        ref_focal_um,
+        verbose=False
+    )
+    print(f"  标定残差: {calib_report_poly['final_rms_um']:.3f} μm")
+
+    # ============================================================
+    # 方法2：混合方法（5阶多项式 + RBF，带平滑）
+    # ============================================================
+    print("\n[方法2] 混合方法（5阶 Poly + RBF）")
+    calibrator_hybrid = HybridCalibrator(
+        poly_degree=5,  # ← 改为5阶
+        rbf_kernel='thin_plate_spline',
+        rbf_smoothing=0.1  # ← 添加平滑
+    )
+    calib_report_hybrid = calibrator_hybrid.calibrate(
+        ref_px_detected,
+        ref_focal_um,
+        verbose=True
+    )
+
+    # ============================================================
+    # 生成测试点
+    # ============================================================
+    print("\n生成 500 个测试点...")
+    coverage_mm = (n_side - 1) * REFERENCE_GRID_SPACING_MM
+    margin = 0.1
+    x_range = coverage_mm * (1 - margin)
+    y_range = coverage_mm * (1 - margin)
+
+    test_focal_um = rng.uniform(
+        [-x_range / 2 * 1000, -y_range / 2 * 1000],
+        [x_range / 2 * 1000, y_range / 2 * 1000],
+        size=(500, 2)
+    )
+
+    # 仿真检测测试点
+    test_px_ideal = focal_to_pixel(test_focal_um)
+    test_px_detected = []
+
+    for px, py in test_px_ideal:
+        patch_size = 50
+        true_cx = patch_size / 2 + (px - round(px))
+        true_cy = patch_size / 2 + (py - round(py))
+        patch = generate_gaussian_spot(
+            true_cx, true_cy,
+            image_size=patch_size,
+            rng=rng,
+            ellipticity_prob=ELLIPTICAL_SPOT_PROB
+        )
+        result = fit_gaussian(patch, sigma_init=SPOT_SIGMA_PX, use_elliptical=True)
+        if result['success']:
+            offset_x = round(px) - patch_size // 2
+            offset_y = round(py) - patch_size // 2
+            detected_x = result['x0'] + offset_x
+            detected_y = result['y0'] + offset_y
+            test_px_detected.append([detected_x, detected_y])
+        else:
+            test_px_detected.append([px, py])
+
+    test_px_detected = np.array(test_px_detected)
+
+    # ============================================================
+    # 测量精度对比
+    # ============================================================
+    # 方法1：纯多项式
+    if hasattr(calibrator_poly, 'pixel_to_focal'):
+        test_focal_poly = calibrator_poly.pixel_to_focal(test_px_detected)
+    elif hasattr(calibrator_poly, 'transform'):
+        test_focal_poly = calibrator_poly.transform(test_px_detected)
+    else:
+        X_poly = calibrator_poly.poly_features.transform(test_px_detected)
+        test_focal_poly = np.column_stack([
+            calibrator_poly.poly_x.predict(X_poly),
+            calibrator_poly.poly_y.predict(X_poly)
+        ])
+
+    errors_poly = test_focal_um - test_focal_poly
+    rmse_poly = np.sqrt(np.mean(errors_poly ** 2))
+
+    # 方法2：混合方法
+    test_focal_hybrid = calibrator_hybrid.pixel_to_focal(test_px_detected)
+    errors_hybrid = test_focal_um - test_focal_hybrid
+    rmse_hybrid = np.sqrt(np.mean(errors_hybrid ** 2))
+
+    # ============================================================
+    # 输出对比
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("精度对比")
+    print("=" * 60)
+    print(f"  纯多项式（5阶）:     {rmse_poly:.3f} μm")
+    print(f"  混合方法（5阶+RBF）: {rmse_hybrid:.3f} μm")
+
+    if rmse_hybrid < rmse_poly:
+        improvement = (rmse_poly - rmse_hybrid) / rmse_poly * 100
+        print(f"  精度提升:            {improvement:.1f}%")
+    else:
+        degradation = (rmse_hybrid - rmse_poly) / rmse_poly * 100
+        print(f"  精度下降:            {degradation:.1f}%")
+        print(f"\n  [说明] 混合方法未能提升精度，可能原因：")
+        print(f"         1. 多项式精度已足够（{calib_report_poly['final_rms_um']:.3f} μm）")
+        print(f"         2. RBF在测试区域外推不稳定")
+        print(f"         3. 建议：121点时直接使用5阶多项式")
+
+    return {
+        'poly_rmse': rmse_poly,
+        'hybrid_rmse': rmse_hybrid,
+        'poly_calib_rms': calib_report_poly['final_rms_um'],
+        'hybrid_calib_rms': calib_report_hybrid['final_residual_rms']
+    }
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='MUST FVC 光纤位置测量系统')
     parser.add_argument('--mode', type=str, default='full',
-                        choices=['full', 'detection', 'calibration', 'measurement'],
+                        choices=['full', 'detection', 'calibration', 'measurement', 'hybrid_test'],
                         help='运行模式：full(完整流程), detection(仅检测), calibration(仅标定), measurement(标定+测量)')
     args = parser.parse_args()
     main(mode=args.mode)

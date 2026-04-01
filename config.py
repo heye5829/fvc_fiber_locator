@@ -70,3 +70,56 @@ RESULTS_FILE = "results/accuracy_report.json"
 print(f"[Config] 焦面尺度: {FOCAL_PLANE_SCALE_UM_PX:.2f} μm/px")
 print(f"[Config] 目标精度: {TARGET_ACCURACY_UM} μm = {TARGET_ACCURACY_PX:.4f} px")
 print(f"[Config] 多项式阶数: {POLY_ORDER}")
+
+
+# ============ 数据集生成协议 ============
+# 仅供 dataset_generator.py 使用，不影响现有任何文件
+
+DATASET_CONFIG = {
+
+    # 场点采样（中等视场 0~0.8R，第四阶段扩全场时加入 1.0）
+    "sample_radii_norm": [0.0, 0.3, 0.6, 0.8],
+    "azimuths_per_radius": 4,       # r=0 时自动只取1个点   8 → 4
+    "field_radius_mm": 625.0,       # 焦面半径，对应1250mm直径
+
+    # SNR 三档，用 peak 值控制
+    # SNR ≈ peak / sqrt(peak + background)
+    "snr_levels": {
+        "high": 5000,   # SNR ≈ 70，与现有 SPOT_PEAK_COUNTS 一致
+        "mid":  1500,   # SNR ≈ 38
+        "low":   500,   # SNR ≈ 22
+    },
+
+    # 离焦三档，在基础 sigma 上叠加额外展宽
+    # 安装公差 ±100μm / 139.12μm/px ≈ 0.72px，取 0.3/0.6 作为轻微/中等
+    "defocus_levels": {
+        "none":   0.0,
+        "medium": 0.6,          # 删掉 slight
+    },
+
+    # 基准光纤数量（同一张图里已知位置的光纤数，用于标定资源敏感性实验）
+    "n_calib_fibers_list": [16, 32, 64],
+
+    # 基准光纤分布方式
+    "calib_distributions": ["uniform", "random"],     # 删掉 ring
+
+    # 前向/反演模型脱钩：生成器加真实扰动，求解器仍用理想高斯
+    "fiber_brightness_variation": 0.15,    # 亮度随机扰动 ±15%
+    "background_gradient": True,            # 背景带轻微梯度
+    "background_gradient_strength": 10.0,  # 梯度强度（counts，跨全图）
+    "pixel_response_nonuniformity": 0.02,  # 像元响应不均匀度 2%
+
+    # 场依赖 PSF（边缘 sigma 比中心大，模拟大视场成像质量下降）
+    "psf_sigma_center_px": 2.0,   # 与现有 SPOT_SIGMA_PX 一致
+    "psf_sigma_edge_px":   2.6,   # 边缘展宽
+    "ellipticity_edge":    1.20,  # 边缘椭圆率上限        # 0.20 → 1.20
+
+    # 每种条件重复次数（不同随机子像素偏移，保证统计稳定性）
+    "n_repeat": 2,              # 3 → 2
+
+    # 输出路径（代码自动创建，无需手动建文件夹）
+    "save_dir": "dataset",
+
+    # 固定随机种子（保证可复现）
+    "seed": 42,
+}
