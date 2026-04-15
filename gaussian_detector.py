@@ -50,19 +50,56 @@ def gaussian_2d_sym(xy, amplitude, x0, y0, sigma, background):
 # ============================================================
 
 def estimate_background(patch, border=3):
-    """用patch边缘像素估计背景"""
-    mask = np.ones(patch.shape, dtype=bool)
-    mask[border:-border, border:-border] = False
-    bg = np.median(patch[mask])
-    return float(bg)
+    """
+    改进版背景估计，修复数值溢出
+    """
+    # ★ 关键：转换为float64
+    img = patch.astype(np.float64)
+    H, W = img.shape
+
+    mask = np.ones((H, W), dtype=bool)
+    if H > 2 * border and W > 2 * border:
+        mask[border:-border, border:-border] = False
+
+    border_pixels = img[mask]
+    if len(border_pixels) == 0:
+        return float(np.percentile(img, 15))
+
+    bg_p25    = float(np.percentile(border_pixels, 25))
+    bg_median = float(np.median(border_pixels))
+    bg_std    = float(np.std(border_pixels))
+    bg_peak   = float(img.max())
+
+    if bg_std > 0.1 * (bg_peak - bg_median + 1e-6):
+        bg = float(np.percentile(img, 15))
+    else:
+        bg = bg_p25
+
+    return max(bg, 0.0)
 
 
 def compute_snr(patch, background):
-    """计算峰值SNR"""
-    peak = float(np.max(patch) - background)
-    noise = float(np.std(patch[:3, :3]))  # 用角落估计噪声
+    """
+    改进版SNR计算，修复数值溢出问题
+    """
+    # ★ 关键：转换为float64防止overflow
+    img = patch.astype(np.float64)
+    bg  = float(background)
+
+    peak = float(np.max(img)) - bg
+    if peak <= 0:
+        return 0.0
+
+    # 用MAD估计噪声（对异常值鲁棒）
+    flat       = img.ravel()
+    median_val = float(np.median(flat))
+    # ★ 关键：先转float64再做差，避免uint溢出
+    mad   = float(np.median(np.abs(flat - median_val)))
+    noise = mad * 1.4826
+
     if noise < 1e-6:
-        noise = np.sqrt(background + 1)
+        noise = max(float(np.sqrt(abs(bg) + 1.0)), 1.0)
+
     return peak / noise
 
 
@@ -260,44 +297,112 @@ class GaussianDetector:
     positions = detector.detect_all(image, seed_positions)
     """
 
+    # def __init__(self, window_sigma=FIT_WINDOW_SIGMA,
+    #              spot_sigma=SPOT_SIGMA_PX,
+    #              # use_elliptical=False):
+    #              use_elliptical=False,
+    #              use_photutils=True):  #  新增参数，默认关闭 photutils
+    #     self.half_win = int(np.ceil(window_sigma * spot_sigma)) + 1
+    #     self.spot_sigma = spot_sigma
+    #     self.use_elliptical = use_elliptical
+    #     self.use_photutils = use_photutils  #  保存为实例变量
+    # ── 修改后 ──────────────────────────────────────────────────
     def __init__(self, window_sigma=FIT_WINDOW_SIGMA,
                  spot_sigma=SPOT_SIGMA_PX,
-                 # use_elliptical=False):
                  use_elliptical=False,
-                 use_photutils=False):  #  新增参数，默认关闭 photutils
-        self.half_win = int(np.ceil(window_sigma * spot_sigma)) + 1
+                 use_photutils=False,
+                 n_iter=2,
+                 half_win=None):  # ← 新增：允许直接覆盖
+
+        if half_win is not None:
+            self.half_win = int(half_win)  # 直接指定，忽略window_sigma
+        else:
+            self.half_win = int(np.ceil(window_sigma * spot_sigma)) + 1
+
         self.spot_sigma = spot_sigma
         self.use_elliptical = use_elliptical
-        self.use_photutils = use_photutils  #  保存为实例变量
+        self.use_photutils = use_photutils
+        self.n_iter = n_iter
 
+        print(f"[GaussianDetector] half_win={self.half_win}px  "
+              f"spot_sigma={self.spot_sigma}  "
+              f"elliptical={self.use_elliptical}")
+
+    # def detect_single(self, image, seed_x, seed_y):
+    #     """
+    #     检测单个光斑
+    #
+    #     Parameters
+    #     ----------
+    #     image          : np.ndarray (H, W)
+    #     seed_x, seed_y : float  粗略质心位置（像素）
+    #
+    #     Returns
+    #     -------
+    #     result : dict  含 'x_global', 'y_global' 全图坐标
+    #     """
+    #     from spot_generator import extract_patch
+    #
+    #     patch, off_x, off_y = extract_patch(image, seed_x, seed_y, self.half_win)
+    #
+    #     if patch.size == 0:
+    #         return {'x_global': seed_x, 'y_global': seed_y, 'success': False}
+    #
+    #     result = fit_gaussian(patch, sigma_init=self.spot_sigma,
+    #                           # use_elliptical=self.use_elliptical)
+    #                           use_elliptical=self.use_elliptical,
+    #                           use_photutils=self.use_photutils)  #  传入参数
+    #
+    #     # 转回全图坐标
+    #     result['x_global'] = result['x0'] + off_x
+    #     result['y_global'] = result['y0'] + off_y
+    #
+    #     return result
+
+    # ── 修改后 ──────────────────────────────────────────────────
     def detect_single(self, image, seed_x, seed_y):
-        """
-        检测单个光斑
-
-        Parameters
-        ----------
-        image          : np.ndarray (H, W)
-        seed_x, seed_y : float  粗略质心位置（像素）
-
-        Returns
-        -------
-        result : dict  含 'x_global', 'y_global' 全图坐标
-        """
         from spot_generator import extract_patch
 
+        # 第一次拟合：用原始seed位置
         patch, off_x, off_y = extract_patch(image, seed_x, seed_y, self.half_win)
 
         if patch.size == 0:
             return {'x_global': seed_x, 'y_global': seed_y, 'success': False}
 
         result = fit_gaussian(patch, sigma_init=self.spot_sigma,
-                              # use_elliptical=self.use_elliptical)
                               use_elliptical=self.use_elliptical,
-                              use_photutils=self.use_photutils)  #  传入参数
+                              use_photutils=self.use_photutils)
 
-        # 转回全图坐标
         result['x_global'] = result['x0'] + off_x
         result['y_global'] = result['y0'] + off_y
+
+        # 迭代精化：用上次拟合中心重新裁窗口再拟合
+        # 好处：第一次拟合后中心更准，重新裁窗口可以减少偏心引起的误差
+        for i in range(self.n_iter - 1):
+            if not result.get('success', False):
+                break  # 上次失败则不迭代
+
+            # 用上次结果的全局坐标作为新seed
+            new_seed_x = result['x_global']
+            new_seed_y = result['y_global']
+
+            patch2, off_x2, off_y2 = extract_patch(
+                image, new_seed_x, new_seed_y, self.half_win
+            )
+
+            if patch2.size == 0:
+                break
+
+            result2 = fit_gaussian(patch2, sigma_init=self.spot_sigma,
+                                   use_elliptical=self.use_elliptical,
+                                   use_photutils=self.use_photutils)
+
+            if not result2.get('success', False):
+                break  # 第二次失败则保留第一次结果
+
+            result2['x_global'] = result2['x0'] + off_x2
+            result2['y_global'] = result2['y0'] + off_y2
+            result = result2  # 用更精确的结果替换
 
         return result
 
@@ -438,37 +543,36 @@ def is_valid_centroid_result(x0, y0, patch_shape, amplitude=None, snr=None, sigm
 
 
 def is_valid_fit_result(result, patch_shape):
+    """
+    有效性检验（平衡检测率和质心精度）
+    """
     H, W = patch_shape
-    x0 = result.get("x0", np.nan)
-    y0 = result.get("y0", np.nan)
-    amp = result.get("amplitude", np.nan)
-    snr = result.get("snr", np.nan)
-    sigma_x = result.get("sigma_x", np.nan)
-    sigma_y = result.get("sigma_y", np.nan)
+    x0      = result.get("x0",       np.nan)
+    y0      = result.get("y0",       np.nan)
+    amp     = result.get("amplitude", np.nan)
+    snr     = result.get("snr",      np.nan)
+    sigma_x = result.get("sigma_x",  np.nan)
+    sigma_y = result.get("sigma_y",  np.nan)
 
-    # 1) 坐标必须有效
     if not (np.isfinite(x0) and np.isfinite(y0)):
         return False
-
-    # 2) 质心必须落在 patch 内
     if not (0.0 <= x0 < W and 0.0 <= y0 < H):
         return False
-
-    # 3) 振幅必须为正
     if not np.isfinite(amp) or amp <= 0:
         return False
 
-    # 4) SNR 太低不通过
+    # ★ 回退：SNR阈值改回 MIN_SNR*0.5（0.3太宽松导致质心精度下降）
     if not np.isfinite(snr) or snr < MIN_SNR * 0.5:
         return False
 
-    # 5) sigma 太离谱不通过
-    if np.isfinite(sigma_x) and not (0.3 <= sigma_x <= 5.0 * SPOT_SIGMA_PX):
+    # ★ 保持放宽的sigma范围（对检测率有帮助且不影响精度）
+    if np.isfinite(sigma_x) and not (0.2 <= sigma_x <= 8.0 * SPOT_SIGMA_PX):
         return False
-    if np.isfinite(sigma_y) and not (0.3 <= sigma_y <= 5.0 * SPOT_SIGMA_PX):
+    if np.isfinite(sigma_y) and not (0.2 <= sigma_y <= 8.0 * SPOT_SIGMA_PX):
         return False
 
     return True
+
 # ============================================================
 # 快速测试
 # ============================================================

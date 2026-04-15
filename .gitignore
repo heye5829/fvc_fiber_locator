@@ -34,6 +34,10 @@ wheels/
 outputs/figures/*.png
 outputs/figures/visualization/*.png
 outputs/results/*.json
+outputs/*.png
+
+# 根目录临时图片（不上传）
+*.png
 
 # 数据集图像（太大，不上传）
 dataset/images/*.npy
