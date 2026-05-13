@@ -393,7 +393,7 @@ def _visualize_reference_spots(ref_focal_um, ref_px_ideal,
 
     ax.set_xlabel('焦面 X (mm)')
     ax.set_ylabel('焦面 Y (mm)')
-    ax.set_title(f'基准光纤分布（{len(ref_focal_um)}个，7×7格网）\n'
+    ax.set_title(f'基准光纤分布（{len(ref_focal_um)}个，11×11格网）\n'
                  f'红色箭头为检测误差放大{scale_factor}倍')
     ax.legend()
     ax.set_aspect('equal')

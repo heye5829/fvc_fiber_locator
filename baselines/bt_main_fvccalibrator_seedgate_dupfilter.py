@@ -136,6 +136,98 @@ def compute_local_quality(image, x, y, half_win=9):
 
 
 
+def mark_duplicate_detections(results_list, seed_positions, duplicate_dist_px=0.3):
+    """
+    对检测结果做重复峰去重。
+
+    如果多个 fiber 检测到几乎同一个坐标，只保留 seed_shift 最小的那个。
+    这可以抑制两个 seed 被同一个强峰吸附的问题。
+
+    Parameters
+    ----------
+    results_list      : list 检测器输出
+    seed_positions    : list 初始 seed 坐标
+    duplicate_dist_px : float 判定为同一检测峰的距离阈值（px）
+
+    Returns
+    -------
+    duplicate_indices : set[int]
+        被判定为重复峰、需要剔除的 fiber index。
+    duplicate_groups  : list[dict]
+        重复峰分组诊断信息。
+    """
+    valid = []
+
+    for i, res in enumerate(results_list):
+        det_x = res.get("x_global", np.nan)
+        det_y = res.get("y_global", np.nan)
+
+        if not (
+            res.get("success", False)
+            and np.isfinite(det_x)
+            and np.isfinite(det_y)
+        ):
+            continue
+
+        seed_x, seed_y = seed_positions[i]
+        seed_shift = float(np.hypot(det_x - seed_x, det_y - seed_y))
+
+        valid.append({
+            "index": int(i),
+            "det_x": float(det_x),
+            "det_y": float(det_y),
+            "seed_shift": seed_shift,
+        })
+
+    duplicate_indices = set()
+    duplicate_groups = []
+    assigned = np.zeros(len(valid), dtype=bool)
+
+    for a in range(len(valid)):
+        if assigned[a]:
+            continue
+
+        cluster = [a]
+        assigned[a] = True
+
+        # 简单半径聚类：把与当前代表点足够近的检测归为同一峰
+        for b in range(a + 1, len(valid)):
+            if assigned[b]:
+                continue
+
+            dist = float(np.hypot(
+                valid[a]["det_x"] - valid[b]["det_x"],
+                valid[a]["det_y"] - valid[b]["det_y"],
+            ))
+
+            if dist < duplicate_dist_px:
+                cluster.append(b)
+                assigned[b] = True
+
+        if len(cluster) <= 1:
+            continue
+
+        # 保留 seed_shift 最小的那个 fiber，其他认为检测到了重复峰
+        cluster_sorted = sorted(cluster, key=lambda k: valid[k]["seed_shift"])
+        keep = cluster_sorted[0]
+        removed = cluster_sorted[1:]
+
+        for k in removed:
+            duplicate_indices.add(valid[k]["index"])
+
+        duplicate_groups.append({
+            "kept_index": int(valid[keep]["index"]),
+            "removed_indices": [int(valid[k]["index"]) for k in removed],
+            "det_x_px": float(valid[keep]["det_x"]),
+            "det_y_px": float(valid[keep]["det_y"]),
+            "kept_seed_shift_px": float(valid[keep]["seed_shift"]),
+            "removed_seed_shift_px": [float(valid[k]["seed_shift"]) for k in removed],
+            "cluster_size": int(len(cluster)),
+        })
+
+    return duplicate_indices, duplicate_groups
+
+
 def choose_poly_degree(n_calib_points: int) -> int:
     """
     参数比 >= 2.0 的策略（不再过于保守）
@@ -238,7 +330,11 @@ def _choose_degree_by_loocv(src_px, dst_um, max_degree=5):
 def run_main_method_on_dataset(image_path, label_path,
                                 max_det_error_px=1.0,
                                 calib_gate_px=1.5,
-                                use_loocv=True):
+                                use_loocv=True,
+                                target_seed_shift_gate_px=0.2,
+                                calib_seed_shift_gate_px=None,
+                                enable_duplicate_filter=True,
+                                duplicate_dist_px=0.3):
     """
     在真实/数据集样本上运行"主方法"的公平对比版本。
 
@@ -265,6 +361,13 @@ def run_main_method_on_dataset(image_path, label_path,
     use_loocv       : bool  是否用 LOOCV 自动选阶数
                             True  → 防过拟合，更可靠
                             False → 用 choose_poly_degree 固定策略
+    target_seed_shift_gate_px: float or None
+                            目标点基于 seed_shift 的真实可用门控阈值。
+                            None 表示不启用。
+    calib_seed_shift_gate_px : float or None
+                            基准点 seed_shift 门控阈值。默认 None，避免过度减少基准点。
+    enable_duplicate_filter : bool 是否启用重复峰去重。
+    duplicate_dist_px       : float 重复峰距离阈值（px）。
     """
     # 1) 读取图像与标签
     image = np.load(image_path).astype(np.float32)
@@ -287,6 +390,17 @@ def run_main_method_on_dataset(image_path, label_path,
         n_iter=2,  #  迭代2次；diagnose_detector.py 对比表明优于 n_iter=1，n_iter=3 无额外收益
     )
     results_list, _ = detector.detect_all(image, seed_positions)
+
+    # ── 新增：重复峰去重诊断/筛选 ───────────────────────────
+    # 如果多个 fiber 被吸附到同一个强峰，只保留 seed_shift 最小的那个。
+    if enable_duplicate_filter:
+        duplicate_indices, duplicate_groups = mark_duplicate_detections(
+            results_list,
+            seed_positions,
+            duplicate_dist_px=duplicate_dist_px,
+        )
+    else:
+        duplicate_indices, duplicate_groups = set(), []
 
     # # ── 修改后 ──────────────────────────────────────────────────
     # detector = GaussianDetector(
@@ -342,17 +456,33 @@ def run_main_method_on_dataset(image_path, label_path,
         gate = calib_gate_px if is_calib else max_det_error_px
 
         det_err_px = np.hypot(det_x - true_x, det_y - true_y)
-        ok = (
-            res.get("success", False)
-            and np.isfinite(det_x)
-            and np.isfinite(det_y)
-            and det_err_px < gate
-        )
 
         # ── 新增：无需真值也可获得的检测质量指标 ─────────────
         # seed_x / seed_y 是检测初始位置，在真实场景中通常来自预测位置或上一轮位置
         seed_x, seed_y = seed_positions[i]
         seed_shift_px = np.hypot(det_x - seed_x, det_y - seed_y)
+
+        # ── 新增：真实可用的 seed_shift 门控 + 重复峰去重 ─────
+        seed_shift_gate = (
+            calib_seed_shift_gate_px if is_calib else target_seed_shift_gate_px
+        )
+
+        if not res.get("success", False):
+            failed_reason = "detector_failed"
+        elif not (np.isfinite(det_x) and np.isfinite(det_y)):
+            failed_reason = "nan_detection"
+        elif enable_duplicate_filter and i in duplicate_indices:
+            failed_reason = "duplicate_peak"
+        elif seed_shift_gate is not None and (
+            not np.isfinite(seed_shift_px) or seed_shift_px >= seed_shift_gate
+        ):
+            failed_reason = "seed_shift_gate"
+        elif not np.isfinite(det_err_px) or det_err_px >= gate:
+            failed_reason = "truth_gate"
+        else:
+            failed_reason = "ok"
+
+        ok = (failed_reason == "ok")
 
         # # 尝试从 detector 返回结果中读取质量字段
         # # 如果某些字段当前 GaussianDetector 没有返回，则记为 None，不影响运行
@@ -409,6 +539,9 @@ def run_main_method_on_dataset(image_path, label_path,
 
             "det_err_px": float(det_err_px) if np.isfinite(det_err_px) else None,
             "gate_px": float(gate),
+            "seed_shift_gate_px": _safe_float_or_none(seed_shift_gate),
+            "duplicate_peak": bool(enable_duplicate_filter and i in duplicate_indices),
+            "failed_reason": failed_reason,
             "in_gate": bool(ok),
 
             # 无需真值的质量指标
@@ -459,6 +592,24 @@ def run_main_method_on_dataset(image_path, label_path,
                         if len(fiber_data) > 0 else 0.0)
     success_rate_calib = calib_ok / calib_total if calib_total > 0 else 0.0
     success_rate_target = target_ok / target_total if target_total > 0 else 0.0
+
+    # ── 新增：失败原因统计 ───────────────────────────────────
+    failed_reason_counts = {}
+    failed_reason_counts_calib = {}
+    failed_reason_counts_target = {}
+
+    for r in per_point_records:
+        reason = r.get("failed_reason", "unknown")
+        failed_reason_counts[reason] = failed_reason_counts.get(reason, 0) + 1
+
+        if r.get("is_calib", False):
+            failed_reason_counts_calib[reason] = (
+                failed_reason_counts_calib.get(reason, 0) + 1
+            )
+        else:
+            failed_reason_counts_target[reason] = (
+                failed_reason_counts_target.get(reason, 0) + 1
+            )
 
     # ── 新增：样本级局部质量统计 ─────────────────────────────
     # 只统计通过门控的目标点，避免失败检测点污染质量分布。
@@ -604,6 +755,17 @@ def run_main_method_on_dataset(image_path, label_path,
         "failed_calib_count": len(failed_calib),
         "failed_target_count":len(failed_target),
 
+        # 新增：失败原因和重复峰诊断
+        "failed_reason_counts": failed_reason_counts,
+        "failed_reason_counts_calib": failed_reason_counts_calib,
+        "failed_reason_counts_target": failed_reason_counts_target,
+        "duplicate_filter_enabled": bool(enable_duplicate_filter),
+        "duplicate_dist_px": _safe_float_or_none(duplicate_dist_px),
+        "duplicate_groups": duplicate_groups,
+        "duplicate_removed_indices": sorted(int(i) for i in duplicate_indices),
+        "target_seed_shift_gate_px": _safe_float_or_none(target_seed_shift_gate_px),
+        "calib_seed_shift_gate_px": _safe_float_or_none(calib_seed_shift_gate_px),
+
         # 主方法内部标定信息（论文写作用）
         "affine_rms_um": calib_report.get("affine_rms_um", None),
         "final_rms_um":  calib_report.get("final_rms_um",  None),
@@ -663,6 +825,12 @@ if __name__ == "__main__":
     CALIB_GATE_PX    = 1.5
     USE_LOOCV        = True
 
+    # 新增：真实可用检测置信门控与重复峰去重
+    TARGET_SEED_SHIFT_GATE_PX = 0.2
+    CALIB_SEED_SHIFT_GATE_PX  = None
+    ENABLE_DUPLICATE_FILTER   = True
+    DUPLICATE_DIST_PX         = 0.3
+
     print(f"[Config] 焦面尺度: {SCALE_UM_PER_PX} μm/px")
     print(f"[Config] 目标精度: {TARGET_UM} μm = "
           f"{TARGET_UM/SCALE_UM_PER_PX:.4f} px")
@@ -670,6 +838,9 @@ if __name__ == "__main__":
     print(f"[Config] 检测器: GaussianDetector.detect_all()")
     print(f"[Config] 标定器: FVCCalibrator")
     print(f"[Config] 目标点门控阈值: max_det_error_px = {MAX_DET_ERR_PX}")
+    print(f"[Config] 目标seed_shift门控: target_seed_shift_gate_px = {TARGET_SEED_SHIFT_GATE_PX}")
+    print(f"[Config] 基准seed_shift门控: calib_seed_shift_gate_px  = {CALIB_SEED_SHIFT_GATE_PX}")
+    print(f"[Config] 重复峰去重:      enable={ENABLE_DUPLICATE_FILTER}, duplicate_dist_px={DUPLICATE_DIST_PX}")
     print(f"[Config] 基准点门控阈值: calib_gate_px    = {CALIB_GATE_PX}  "
           f"← 宽松门控，增加基准点数量")
     print(f"[Config] LOOCV 选阶数:   use_loocv        = {USE_LOOCV}  "
@@ -703,6 +874,10 @@ if __name__ == "__main__":
                 max_det_error_px=MAX_DET_ERR_PX,
                 calib_gate_px=CALIB_GATE_PX,
                 use_loocv=USE_LOOCV,
+                target_seed_shift_gate_px=TARGET_SEED_SHIFT_GATE_PX,
+                calib_seed_shift_gate_px=CALIB_SEED_SHIFT_GATE_PX,
+                enable_duplicate_filter=ENABLE_DUPLICATE_FILTER,
+                duplicate_dist_px=DUPLICATE_DIST_PX,
             )
 
             print(f"总检测率: {res['success_rate_all']*100:.1f}%")
@@ -715,6 +890,10 @@ if __name__ == "__main__":
                   f"{res['failed_calib_count']} -> {res['failed_calib']}")
             print(f"未通过检测/门控的待测光纤: "
                   f"{res['failed_target_count']} -> {res['failed_target']}")
+            print(f"[失败原因/全部] {res.get('failed_reason_counts', {})}")
+            print(f"[失败原因/目标] {res.get('failed_reason_counts_target', {})}")
+            print(f"[重复峰] removed={len(res.get('duplicate_removed_indices', []))} "
+                  f"groups={len(res.get('duplicate_groups', []))}")
             print(f"[质心精度] RMSE: {res['centroid_rmse_px']:.6f} px")
             print(f"[主方法标定] Affine RMS: {res['affine_rms_um']}")
             print(f"[主方法标定] Final  RMS: {res['final_rms_um']}")
@@ -786,6 +965,6 @@ if __name__ == "__main__":
         )
 
     save_path = os.path.join(
-        output_dir, "main_method_on_dataset_results.json"
+        output_dir, "main_method_on_dataset_results_seedgate_dupfilter.json"
     )
     save_results_json(packed_results, save_path)

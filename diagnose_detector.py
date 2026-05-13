@@ -1,6 +1,4 @@
 """
-diagnose_detector.py
-
 对比三种检测配置在门控内的质心精度：
   A：原始（photutils优先）
   B：scipy_enhanced（倾斜背景，无迭代）
@@ -118,33 +116,23 @@ if __name__ == "__main__":
 
 
     configs = [
-        # 当前基准（half_win=9，FIT_WINDOW_SIGMA=4）
-        ("当前_win9",
+        ("基准_n1_win9",
          GaussianDetector(use_photutils=False,
                           use_elliptical=True,
                           n_iter=1,
-                          half_win=9)),  # 当前值
+                          half_win=9)),
 
-        # 缩小到7
-        ("测试_win7",
+        ("测试_n2_win9",
          GaussianDetector(use_photutils=False,
                           use_elliptical=True,
-                          n_iter=1,
-                          half_win=7)),
+                          n_iter=2,
+                          half_win=9)),
 
-        # 缩小到6（极限）
-        ("测试_win6",
+        ("测试_n3_win9",
          GaussianDetector(use_photutils=False,
                           use_elliptical=True,
-                          n_iter=1,
-                          half_win=6)),
-
-        # 放大到11（对比验证）
-        ("测试_win11",
-         GaussianDetector(use_photutils=False,
-                          use_elliptical=True,
-                          n_iter=1,
-                          half_win=11)),
+                          n_iter=3,
+                          half_win=9)),
     ]
 
     all_results = {}
@@ -173,7 +161,7 @@ if __name__ == "__main__":
 
     # ── 汇总对比表 ──────────────────────────────────────────────
     print(f"\n\n{'='*60}")
-    print(f"汇总对比（门控内RMSE，与主脚本可比）")
+    print(f"迭代次数对比（固定 half_win=9，门控内RMSE）")
     print(f"{'='*60}")
     print(f"{'配置':<25} {'00532门控RMSE':>14} "
           f"{'00532通过率':>11} {'00608门控RMSE':>14} {'00608通过率':>11}")
@@ -256,16 +244,25 @@ if __name__ == "__main__":
     print(f"  {'-'*55}")
     scores = []
     for label, _ in configs:
-        r532   = all_results["sample_00532"][label]
-        rmse   = r532["gate"]["rmse"]
-        rate   = r532["n_in_gate"] / r532["n_total"]
-        score  = rate / rmse          # 通过率/RMSE，越大越好
-        scores.append((label, score, rmse, rate*100))
+        r532 = all_results["sample_00532"][label]
+        r608 = all_results["sample_00608"][label]
+
+        rmse532 = r532["gate"]["rmse"]
+        rmse608 = r608["gate"]["rmse"]
+        rate532 = r532["n_in_gate"] / r532["n_total"]
+        rate608 = r608["n_in_gate"] / r608["n_total"]
+
+        score532 = rate532 / rmse532
+        score608 = rate608 / rmse608
+        score_avg = 0.5 * (score532 + score608)
+
+        scores.append((label, score_avg, rmse532, rate532*100, rmse608, rate608*100))
     scores.sort(key=lambda x: -x[1])
-    for label, score, rmse, rate in scores:
+    for label, score, rmse532, rate532, rmse608, rate608 in scores:
         marker = " ← 推荐" if label == scores[0][0] else ""
         print(f"  {label:<20} {score:>10.1f}  "
-              f"RMSE={rmse:.4f}px  率={rate:.1f}%{marker}")
+              f"00532: RMSE={rmse532:.4f}px  率={rate532:.1f}%  "
+              f"00608: RMSE={rmse608:.4f}px  率={rate608:.1f}%{marker}")
 
     print(f"\n  结论：")
     best_overall = scores[0][0]
@@ -273,5 +270,11 @@ if __name__ == "__main__":
     print(f"    当前精度瓶颈：检测误差 ~0.068px = "
           f"{0.068*scale:.1f}μm")
     print(f"    目标精度：3μm = 0.022px")
-    print(f"    下一步：提升质心精度（方向2），"
-          f"这是从10μm→3μm的必经之路")
+
+    print(f"\n  决策建议：")
+    if best_overall != "基准_n1_win9":
+        print(f"    建议将 bt_main_fvccalibrator.py 中的 n_iter "
+              f"由 1 改为更优值：{best_overall}")
+    else:
+        print(f"    n_iter 增加后无明显收益，暂不建议修改 bt_main_fvccalibrator.py")
+    print(f"    若最佳配置相对基准提升 < 10%，则下一步转向 SNR分析 或 PSF模板法")
